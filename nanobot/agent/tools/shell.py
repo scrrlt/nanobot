@@ -11,7 +11,7 @@ from nanobot.agent.tools.base import Tool
 
 class ExecTool(Tool):
     """Tool to execute shell commands."""
-    
+
     def __init__(
         self,
         timeout: int = 60,
@@ -23,26 +23,26 @@ class ExecTool(Tool):
         self.timeout = timeout
         self.working_dir = working_dir
         self.deny_patterns = deny_patterns or [
-            r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
-            r"\bdel\s+/[fq]\b",              # del /f, del /q
-            r"\brmdir\s+/s\b",               # rmdir /s
-            r"\b(format|mkfs|diskpart)\b",   # disk operations
-            r"\bdd\s+if=",                   # dd
-            r">\s*/dev/sd",                  # write to disk
+            r"\brm\s+-[rf]{1,2}\b",  # rm -r, rm -rf, rm -fr
+            r"\bdel\s+/[fq]\b",  # del /f, del /q
+            r"\brmdir\s+/s\b",  # rmdir /s
+            r"\b(format|mkfs|diskpart)\b",  # disk operations
+            r"\bdd\s+if=",  # dd
+            r">\s*/dev/sd",  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
-            r":\(\)\s*\{.*\};\s*:",          # fork bomb
+            r":\(\)\s*\{.*\};\s*:",  # fork bomb
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
-    
+
     @property
     def name(self) -> str:
         return "exec"
-    
+
     @property
     def description(self) -> str:
         return "Execute a shell command and return its output. Use with caution."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
@@ -50,22 +50,47 @@ class ExecTool(Tool):
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The shell command to execute",
                 },
-                "working_dir": {
-                    "type": "string",
-                    "description": "Optional working directory for the command"
-                }
+                "force": {"type": "boolean", "description": "Override safety checks."},
+                "reason": {"type": "string", "description": "Required if force=True."},
             },
-            "required": ["command"]
+            "required": ["command"],
         }
-    
-    async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
+
+    def _is_soft_failure(self, command: str, stdout: str, stderr: str) -> bool:
+        """Scan for errors, but whitelist 'read' commands from stdout scanning."""
+        fatal = ["permission denied", "not found", "fatal error", "syntax error"]
+        if any(p in stderr.lower() for p in fatal):
+            return True
+
+        # Don't fail if we are just reading a log file containing 'error'
+        readers = ["cat", "grep", "head", "tail", "less", "awk"]
+        parts = command.strip().split()
+        if parts and parts[0] in readers:
+            return False
+
+        return any(p in stdout.lower() for p in fatal)
+
+    async def execute(self, **kwargs: Any) -> str:
+        command = kwargs.get("command")
+        working_dir = kwargs.get("working_dir")
+        force = kwargs.get("force", False)
+        reason = kwargs.get("reason")
+
+        if not command:
+            return "STATUS: FAILED\nError: 'command' parameter is required."
+
+        if force and not reason:
+            return "STATUS: FAILED\nError: 'reason' is required when 'force' is True."
+
         cwd = working_dir or self.working_dir or os.getcwd()
-        guard_error = self._guard_command(command, cwd)
-        if guard_error:
-            return guard_error
-        
+
+        if not force:
+            guard_error = self._guard_command(command, cwd)
+            if guard_error:
+                return f"STATUS: FAILED\n{guard_error}"
+
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -73,40 +98,43 @@ class ExecTool(Tool):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
             )
-            
+
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout
+                    process.communicate(), timeout=self.timeout
                 )
             except asyncio.TimeoutError:
                 process.kill()
-                return f"Error: Command timed out after {self.timeout} seconds"
-            
-            output_parts = []
-            
-            if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
-            
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                if stderr_text.strip():
-                    output_parts.append(f"STDERR:\n{stderr_text}")
-            
-            if process.returncode != 0:
-                output_parts.append(f"\nExit code: {process.returncode}")
-            
-            result = "\n".join(output_parts) if output_parts else "(no output)"
-            
+                return f"STATUS: FAILED\nError: Command timed out after {self.timeout} seconds"
+
+            stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
+            stderr_str = stderr.decode("utf-8", errors="replace") if stderr else ""
+
+            is_hard_fail = process.returncode != 0
+            is_soft_fail = self._is_soft_failure(command, stdout_str, stderr_str)
+            is_quiet = not stdout_str.strip() and not stderr_str.strip()
+
+            if is_hard_fail or is_soft_fail:
+                header = "STATUS: FAILED"
+                body = f"EXIT: {process.returncode}\n{stderr_str or stdout_str}"
+            else:
+                header = "STATUS: SUCCESS"
+                body = stdout_str if not is_quiet else "(Success. No output.)"
+
+            result = f"{header}\n{body}"
+
             # Truncate very long output
             max_len = 10000
             if len(result) > max_len:
-                result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
-            
+                result = (
+                    result[:max_len]
+                    + f"\n... (truncated, {len(result) - max_len} more chars)"
+                )
+
             return result
-            
+
         except Exception as e:
-            return f"Error executing command: {str(e)}"
+            return f"STATUS: FAILED\nError executing command: {str(e)}"
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""
