@@ -17,6 +17,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.planning import UpdatePlanTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
 from nanobot.agent.safety import OscillationDetector
@@ -99,6 +100,9 @@ class AgentLoop:
         spawn_tool = SpawnTool(manager=self.subagents)
         self.tools.register(spawn_tool)
 
+        # Planning tool
+        self.tools.register(UpdatePlanTool())
+
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
@@ -144,6 +148,7 @@ class AgentLoop:
 
         # --- PHASE 1: ROUTING & DRAFTING ---
         active_plan = None
+        plan: dict[str, Any] = {}
         if await classify_intent(msg.content, self.provider, self.model):
             try:
                 # Detached Planning Call
@@ -204,6 +209,26 @@ class AgentLoop:
                 )
 
                 for tool in response.tool_calls:
+                    # --- Plan Update Interceptor ---
+                    if tool.name == "update_plan":
+                        new_strategy = tool.arguments.get("strategy", [])
+                        active_plan = (
+                            f"## OPERATIONAL PLAN (IMMUTABLE)\n"
+                            f"GOAL: {plan.get('analysis', 'N/A')}\n"
+                            f"STEPS:\n" + "\n".join(f"- {s}" for s in new_strategy)
+                        )
+                        # Rebuild messages with the new plan
+                        messages = self.context.build_messages(
+                            history=session.get_history(),
+                            current_message=msg.content,
+                            system_suffix=active_plan,
+                        )
+                        # Add the tool result for the update_plan call
+                        messages = self.context.add_tool_result(
+                            messages, tool.id, tool.name, "Plan updated successfully."
+                        )
+                        continue
+
                     # --- SAFETY INTERCEPTOR ---
                     is_forced = tool.arguments.get("force", False)
                     safety_err = safety.check(tool.name, tool.arguments)
@@ -217,7 +242,7 @@ class AgentLoop:
                         )
                     else:
                         # ALLOW ACTION
-                        result = await self.tools.execute(**tool.arguments)
+                        result = await self.tools.execute(tool.name, tool.arguments)
 
                     # --- REFLECTION TRIGGER ---
                     if "STATUS: FAILED" in result:
