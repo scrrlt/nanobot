@@ -3,10 +3,11 @@
 import asyncio
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any
 
-from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.base import STATUS_FAILED, STATUS_SUCCESS, Tool
 
 
 class ExecTool(Tool):
@@ -66,9 +67,34 @@ class ExecTool(Tool):
 
         # Don't fail if we are just reading a log file containing 'error'
         readers = ["cat", "grep", "head", "tail", "less", "awk"]
-        parts = command.strip().split()
-        if parts and parts[0] in readers:
-            return False
+        try:
+            # Parse command robustly to handle absolute paths and env vars
+            tokens = shlex.split(command.strip())
+            if not tokens:
+                return any(p in stdout.lower() for p in fatal)
+
+            # Skip environment variable assignments
+            executable_token = None
+            for token in tokens:
+                if "=" not in token:  # Not an env var assignment
+                    executable_token = token
+                    break
+
+            if executable_token:
+                # Extract basename for comparison
+                executable_name = os.path.basename(executable_token).lower()
+                if executable_name in readers:
+                    return False
+        except (
+            ValueError
+        ):  # Fallback for malformed commands that shlex.split cannot parse
+            # Use simple whitespace splitting as a best-effort heuristic.
+            # This may misidentify the executable for complex shell constructs,
+            # so in ambiguous cases we conservatively treat the command as non-reader
+            # and still scan stdout for fatal patterns below.
+            parts = command.strip().split()
+            if parts and os.path.basename(parts[0]).lower() in readers:
+                return False
 
         return any(p in stdout.lower() for p in fatal)
 
@@ -79,17 +105,17 @@ class ExecTool(Tool):
         reason = kwargs.get("reason")
 
         if not command:
-            return "STATUS: FAILED\nError: 'command' parameter is required."
+            return f"{STATUS_FAILED}\nError: 'command' parameter is required."
 
         if force and not reason:
-            return "STATUS: FAILED\nError: 'reason' is required when 'force' is True."
+            return f"{STATUS_FAILED}\nError: 'reason' is required when 'force' is True."
 
         cwd = working_dir or self.working_dir or os.getcwd()
 
         if not force:
             guard_error = self._guard_command(command, cwd)
             if guard_error:
-                return f"STATUS: FAILED\n{guard_error}"
+                return f"{STATUS_FAILED}\n{guard_error}"
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -103,9 +129,31 @@ class ExecTool(Tool):
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(), timeout=self.timeout
                 )
-            except asyncio.TimeoutError:
-                process.kill()
-                return f"STATUS: FAILED\nError: Command timed out after {self.timeout} seconds"
+            except TimeoutError:
+                # Attempt graceful termination before forcing a kill and always
+                # wait for the process to avoid zombies.
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except TimeoutError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        try:
+                            await asyncio.wait_for(process.wait(), timeout=5)
+                        except TimeoutError:
+                            pass
+
+                return (
+                    f"{STATUS_FAILED}\nError: Command timed out after"
+                    f" {self.timeout} seconds"
+                )
 
             stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
             stderr_str = stderr.decode("utf-8", errors="replace") if stderr else ""
@@ -115,10 +163,10 @@ class ExecTool(Tool):
             is_quiet = not stdout_str.strip() and not stderr_str.strip()
 
             if is_hard_fail or is_soft_fail:
-                header = "STATUS: FAILED"
+                header = STATUS_FAILED
                 body = f"EXIT: {process.returncode}\n{stderr_str or stdout_str}"
             else:
-                header = "STATUS: SUCCESS"
+                header = STATUS_SUCCESS
                 body = stdout_str if not is_quiet else "(Success. No output.)"
 
             result = f"{header}\n{body}"
@@ -134,7 +182,7 @@ class ExecTool(Tool):
             return result
 
         except Exception as e:
-            return f"STATUS: FAILED\nError executing command: {str(e)}"
+            return f"{STATUS_FAILED}\nError executing command: {str(e)}"
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands."""

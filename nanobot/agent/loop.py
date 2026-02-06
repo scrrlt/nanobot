@@ -2,27 +2,35 @@
 
 import asyncio
 import json
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from loguru import logger
 
+from nanobot.agent.context import ContextBuilder
+from nanobot.agent.router import classify_intent
+from nanobot.agent.safety import OscillationDetector
+from nanobot.agent.schemas import DraftingPhase
+from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tools.base import STATUS_FAILED
+from nanobot.agent.tools.filesystem import (
+    EditFileTool,
+    ListDirTool,
+    ReadFileTool,
+    WriteFileTool,
+)
+from nanobot.agent.tools.message import MessageTool
+from nanobot.agent.tools.planning import UpdatePlanTool
+from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
-from nanobot.agent.context import ContextBuilder
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebSearchTool, WebFetchTool
-from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.planning import UpdatePlanTool
-from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
-from nanobot.agent.safety import OscillationDetector
-from nanobot.agent.router import classify_intent
-from nanobot.agent.schemas import DraftingPhase
 from nanobot.utils.parsing import parse_llm_json
 
 
@@ -38,25 +46,47 @@ class AgentLoop:
     5. Sends responses back
     """
 
+    # Maximum number of cached oscillation detectors to retain. This is a
+    # conservative default sized for typical interactive workloads; tuneable via
+    # subclassing or future configuration if deployments require broader fan-out.
+    MAX_OSCILLATION_DETECTORS = 100
+
     def __init__(
         self,
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
+        fast_model: str | None = None,
         max_iterations: int = 20,
         brave_api_key: str | None = None,
-        exec_config: "ExecToolConfig | None" = None,
+        exec_config: ExecToolConfig | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig
+        """
+        Initialize the AgentLoop.
+
+        Args:
+            bus: The message bus for communication.
+            provider: The LLM provider.
+            workspace: The agent's workspace directory.
+            model: The primary LLM model to use.
+            fast_model: A faster, cheaper model for routing and planning. If not
+                provided, the primary model is used.
+            max_iterations: Max tool execution iterations per message.
+            brave_api_key: API key for Brave Search.
+            exec_config: Configuration for the shell execution tool.
+        """
         self.bus = bus
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self.fast_model = fast_model or self.model
         self.max_iterations = max_iterations
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
-        self.oscillation_detectors: dict[str, OscillationDetector] = {}
+        self.oscillation_detectors: OrderedDict[str, OscillationDetector] = (
+            OrderedDict()
+        )
 
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
@@ -72,6 +102,31 @@ class AgentLoop:
 
         self._running = False
         self._register_default_tools()
+
+    @staticmethod
+    def _format_plan(analysis: str | None, strategy: list[str]) -> str:
+        """Create a standard representation for the operational plan."""
+        goal_text = analysis.strip() if analysis else "N/A"
+        steps = strategy if strategy else ["No steps defined."]
+        steps_text = "\n".join(f"- {step}" for step in steps)
+        return (
+            "## OPERATIONAL PLAN (IMMUTABLE)\n"
+            f"GOAL: {goal_text}\n"
+            "STEPS:\n"
+            f"{steps_text}"
+        )
+
+    @staticmethod
+    def _normalize_strategy(raw_strategy: Any) -> list[str]:
+        """Normalize strategy input to a list of strings."""
+        if isinstance(raw_strategy, list):
+            sequence = cast(list[Any], raw_strategy)
+        elif raw_strategy is None:
+            sequence = []
+        else:
+            sequence = [raw_strategy]
+
+        return [str(step) for step in sequence]
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -141,15 +196,32 @@ class AgentLoop:
         session = self.sessions.get_or_create(msg.session_key)
 
         if msg.session_key not in self.oscillation_detectors:
+            # Clean up old detectors if at capacity
+            if len(self.oscillation_detectors) >= self.MAX_OSCILLATION_DETECTORS:
+                # Remove least recently used detector
+                self.oscillation_detectors.popitem(last=False)
+
             self.oscillation_detectors[msg.session_key] = OscillationDetector(
                 self.workspace
             )
+        else:
+            # Move to end (most recently used)
+            self.oscillation_detectors.move_to_end(msg.session_key)
+
         safety = self.oscillation_detectors[msg.session_key]
 
         # --- PHASE 1: ROUTING & DRAFTING ---
         active_plan = None
         plan: dict[str, Any] = {}
-        if await classify_intent(msg.content, self.provider, self.model):
+        try:
+            is_direct = await classify_intent(
+                msg.content, self.provider, self.fast_model
+            )
+        except Exception as err:
+            logger.error(f"Error in classify_intent: {err}")
+            is_direct = False  # Safe fallback - treat as non-direct intent
+
+        if is_direct:
             try:
                 # Detached Planning Call
                 draft = await self.provider.chat(
@@ -158,16 +230,20 @@ class AgentLoop:
                         "type": "json_object",
                         "schema": DraftingPhase.model_json_schema(),
                     },
-                    model=self.model,  # or cheaper model
+                    model=self.fast_model,  # Use fast model for planning phase
                 )
                 if draft and draft.content:
-                    plan = parse_llm_json(draft.content)
-                    active_plan = (
-                        f"## OPERATIONAL PLAN (IMMUTABLE)\n"
-                        f"GOAL: {plan.get('analysis', 'N/A')}\n"
-                        f"STEPS:\n"
-                        + "\n".join(f"- {s}" for s in plan.get("strategy", []))
+                    parsed_plan = parse_llm_json(draft.content)
+                    if isinstance(parsed_plan, dict):
+                        plan = parsed_plan
+
+                    strategy_steps = self._normalize_strategy(plan.get("strategy"))
+                    plan["strategy"] = strategy_steps
+                    analysis_value = plan.get("analysis")
+                    analysis_text = (
+                        analysis_value if isinstance(analysis_value, str) else None
                     )
+                    active_plan = self._format_plan(analysis_text, strategy_steps)
             except Exception as e:
                 logger.warning(f"Drafting failed: {e}")
 
@@ -211,17 +287,26 @@ class AgentLoop:
                 for tool in response.tool_calls:
                     # --- Plan Update Interceptor ---
                     if tool.name == "update_plan":
-                        new_strategy = tool.arguments.get("strategy", [])
-                        active_plan = (
-                            f"## OPERATIONAL PLAN (IMMUTABLE)\n"
-                            f"GOAL: {plan.get('analysis', 'N/A')}\n"
-                            f"STEPS:\n" + "\n".join(f"- {s}" for s in new_strategy)
+                        strategy_steps = self._normalize_strategy(
+                            tool.arguments.get("strategy")
                         )
-                        # Rebuild messages with the new plan
-                        messages = self.context.build_messages(
-                            history=session.get_history(),
-                            current_message=msg.content,
-                            system_suffix=active_plan,
+                        plan["strategy"] = strategy_steps
+
+                        new_analysis = tool.arguments.get("analysis")
+                        if isinstance(new_analysis, str) and new_analysis.strip():
+                            plan["analysis"] = new_analysis.strip()
+
+                        analysis_value = plan.get("analysis")
+                        analysis_text = (
+                            analysis_value if isinstance(analysis_value, str) else None
+                        )
+
+                        active_plan = self._format_plan(
+                            analysis_text, plan.get("strategy", [])
+                        )
+                        # Update system suffix in existing messages instead of rebuilding
+                        messages = self.context.update_system_suffix(
+                            messages, active_plan
                         )
                         # Add the tool result for the update_plan call
                         messages = self.context.add_tool_result(
@@ -245,7 +330,7 @@ class AgentLoop:
                         result = await self.tools.execute(tool.name, tool.arguments)
 
                     # --- REFLECTION TRIGGER ---
-                    if "STATUS: FAILED" in result:
+                    if result.startswith(STATUS_FAILED):
                         result += (
                             "\n\n[SYSTEM INTERVENTION]\n"
                             "PROTOCOL: STOP. Do not retry identical command.\n"
@@ -376,12 +461,22 @@ class AgentLoop:
         Returns:
             The agent's response.
         """
+        channel = "cli"
+        chat_id = "direct"
+        if session_key:
+            if ":" in session_key:
+                channel, chat_id = session_key.split(":", 1)
+            else:
+                chat_id = session_key
+
         msg = InboundMessage(
-            channel="cli",
-            sender_id="user",
-            chat_id="direct",
-            content=content
+            channel=channel, sender_id="user", chat_id=chat_id, content=content
         )
 
-        response = await self._process_message(msg)
+        try:
+            response = await self._process_message(msg)
+        except Exception as err:
+            logger.error(f"Error processing direct message: {err}")
+            return f"Error processing message: {err}"
+
         return response.content if response else ""

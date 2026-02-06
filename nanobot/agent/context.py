@@ -23,6 +23,7 @@ class ContextBuilder:
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
+        self._cached_base_prompt: str | None = None
 
     def build_system_prompt(self) -> str:
         """
@@ -114,7 +115,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         history: list[dict[str, Any]],
         current_message: str,
         media: list[str] | None = None,
-        system_suffix: str | None = None,  # <--- New arg
+        system_suffix: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -128,7 +129,9 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         Returns:
             List of messages including system prompt.
         """
-        prompt = self.build_system_prompt()
+        base_prompt = self.build_system_prompt()
+        self._cached_base_prompt = base_prompt
+        prompt = base_prompt
         if system_suffix:
             prompt += f"\n\n{system_suffix}"  # Append Plan
 
@@ -210,4 +213,35 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             msg["tool_calls"] = tool_calls
 
         messages.append(msg)
+        return messages
+
+    def update_system_suffix(
+        self,
+        messages: list[dict[str, Any]],
+        system_suffix: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Update the system message suffix in an existing message list.
+
+        Args:
+            messages: Current message list.
+            system_suffix: New suffix to append to the system prompt.
+
+        Returns:
+            Updated message list with modified system message.
+        """
+        if not messages or messages[0]["role"] != "system":
+            # No system message found; return messages unchanged
+            return messages
+
+        # Use cached base prompt when available to avoid redundant I/O
+        base_prompt = self._cached_base_prompt or self.build_system_prompt()
+        self._cached_base_prompt = base_prompt
+        prompt = base_prompt
+        if system_suffix:
+            prompt = f"{base_prompt}\n\n{system_suffix}"
+
+        # Update the first message (system message)
+        messages[0]["content"] = prompt
+
         return messages
