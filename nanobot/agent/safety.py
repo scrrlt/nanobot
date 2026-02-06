@@ -59,6 +59,7 @@ class OscillationDetector:
             return (
                 "STATUS: OSCILLATION DETECTED\n"
                 "SYSTEM ALERT: You are checking the same state repeatedly without changing it.\n"
-                "PROTOCOL: Perform a write action, change your query, or use 'force=True'."
+                "PROTOCOL: Perform a write action, change your query, or retry "
+                "with force=true and a reason."
             )
         return None

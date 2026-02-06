@@ -1,5 +1,7 @@
 from typing import Any
 
+import pytest
+
 from nanobot.agent.tools.base import Tool
 from nanobot.agent.tools.registry import ToolRegistry
 
@@ -34,6 +36,48 @@ class SampleTool(Tool):
                 },
             },
             "required": ["query", "count"],
+        }
+
+    async def execute(self, **kwargs: Any) -> str:
+        return "ok"
+
+
+class UnionTool(Tool):
+    @property
+    def name(self) -> str:
+        return "union"
+
+    @property
+    def description(self) -> str:
+        return "tool with union-typed parameters"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "value": {"type": ["string", "number"]},
+                "items": {
+                    "type": "array",
+                    "items": {"type": ["string", "number", "boolean"]},
+                },
+                "payload": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                        },
+                    ]
+                },
+                "marker": {
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        {"type": "integer", "minimum": 0},
+                    ]
+                },
+            },
+            "required": ["value", "items", "payload", "marker"],
         }
 
     async def execute(self, **kwargs: Any) -> str:
@@ -81,8 +125,77 @@ def test_validate_params_ignores_unknown_fields() -> None:
     assert errors == []
 
 
+@pytest.mark.asyncio
 async def test_registry_returns_validation_error() -> None:
     reg = ToolRegistry()
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+def test_union_type_validation_supports_multiple_candidates() -> None:
+    tool = UnionTool()
+    assert (
+        tool.validate_params(
+            {
+                "value": "alpha",
+                "items": ["one", 2, True],
+                "payload": [1, 2, 3],
+                "marker": 1,
+            }
+        )
+        == []
+    )
+
+    assert (
+        tool.validate_params(
+            {
+                "value": 9,
+                "items": ["x"],
+                "payload": "ready",
+                "marker": "tag",
+            }
+        )
+        == []
+    )
+
+
+def test_union_type_validation_reports_errors() -> None:
+    tool = UnionTool()
+    errors = tool.validate_params(
+        {
+            "value": [1],
+            "items": ["ok", {"oops": True}],
+            "payload": [1, "bad"],
+            "marker": 1,
+        }
+    )
+
+    joined = "; ".join(errors)
+    assert "value should match one of types" in joined
+    assert "items[1]" in joined
+    assert "payload did not match any allowed schema option" in joined
+
+
+def test_one_of_requires_exact_match() -> None:
+    tool = UnionTool()
+    errors = tool.validate_params(
+        {
+            "value": "x",
+            "items": ["x"],
+            "payload": "ready",
+            "marker": "",
+        }
+    )
+
+    assert any("oneOf" in err for err in errors)
+
+    errors = tool.validate_params(
+        {
+            "value": "x",
+            "items": ["x"],
+            "payload": "ready",
+            "marker": 0,
+        }
+    )
+    assert errors == []

@@ -101,11 +101,27 @@ class LiteLLMProvider(LLMProvider):
         # For vLLM, use hosted_vllm/ prefix per LiteLLM docs
         # Convert openai/ prefix to hosted_vllm/ if user specified it
         if self.is_vllm:
-            model = f"hosted_vllm/{model}"
+            if model.startswith("hosted_vllm/"):
+                pass
+            elif model.startswith("openai/"):
+                model = f"hosted_vllm/{model.removeprefix('openai/')}"
+            else:
+                model = f"hosted_vllm/{model}"
 
-        # For Gemini, ensure gemini/ prefix if not already present
-        if "gemini" in model.lower() and not model.startswith("gemini/"):
-            model = f"gemini/{model}"
+        # For Gemini, ensure gemini/ prefix if not already present.
+        # Some providers alias Gemini models (e.g., "google/gemini-1.5-pro"). We
+        # normalize any identifier containing "gemini" unless it is already
+        # prefixed, to maintain compatibility with LiteLLM routing.
+        if "gemini" in model.lower():
+            if "/" not in model:
+                model = f"gemini/{model}"
+            elif not model.split("/", 1)[0].lower() in {
+                "gemini",
+                "google",
+                "vertex_ai",
+                "openrouter",
+            }:
+                model = f"gemini/{model}"
 
         kwargs: dict[str, Any] = {
             "model": model,
