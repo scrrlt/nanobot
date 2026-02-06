@@ -8,6 +8,8 @@ from rich.console import Console
 from rich.table import Table
 
 from nanobot import __version__, __logo__
+from nanobot.config.loader import ConfigLoadError, load_config
+from nanobot.config.schema import Config
 
 app = typer.Typer(
     name="nanobot",
@@ -16,6 +18,15 @@ app = typer.Typer(
 )
 
 console = Console()
+
+
+def _load_config_or_exit() -> Config:
+    """Load configuration or exit with an error message."""
+    try:
+        return load_config()
+    except ConfigLoadError as err:
+        console.print(f"[red]Failed to load configuration:[/red] {err}")
+        raise typer.Exit(1)
 
 
 def version_callback(value: bool):
@@ -43,7 +54,6 @@ def main(
 def onboard():
     """Initialize nanobot configuration and workspace."""
     from nanobot.config.loader import get_config_path, save_config
-    from nanobot.config.schema import Config
     from nanobot.utils.helpers import get_workspace_path
 
     config_path = get_config_path()
@@ -156,7 +166,7 @@ def gateway(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ):
     """Start the nanobot gateway."""
-    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.config.loader import get_data_dir
     from nanobot.bus.queue import MessageBus
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.agent.loop import AgentLoop
@@ -171,7 +181,7 @@ def gateway(
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
 
-    config = load_config()
+    config = _load_config_or_exit()
 
     # Create components
     bus = MessageBus()
@@ -282,12 +292,11 @@ def agent(
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ):
     """Interact with the agent directly."""
-    from nanobot.config.loader import load_config
     from nanobot.bus.queue import MessageBus
     from nanobot.providers.litellm_provider import LiteLLMProvider
     from nanobot.agent.loop import AgentLoop
 
-    config = load_config()
+    config = _load_config_or_exit()
 
     api_key = config.get_api_key()
     api_base = config.get_api_base()
@@ -355,9 +364,7 @@ app.add_typer(channels_app, name="channels")
 @channels_app.command("status")
 def channels_status():
     """Show channel status."""
-    from nanobot.config.loader import load_config
-
-    config = load_config()
+    config = _load_config_or_exit()
 
     table = Table(title="Channel Status")
     table.add_column("Channel", style="cyan")
@@ -625,10 +632,10 @@ def cron_run(
 @app.command()
 def status():
     """Show nanobot status."""
-    from nanobot.config.loader import load_config, get_config_path
+    from nanobot.config.loader import get_config_path
 
     config_path = get_config_path()
-    config = load_config()
+    config = _load_config_or_exit()
     workspace = config.workspace_path
 
     console.print(f"{__logo__} nanobot Status\n")

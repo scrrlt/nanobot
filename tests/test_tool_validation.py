@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 
 from nanobot.agent.tools.base import Tool
-from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.registry import ToolExecutionStatus, ToolRegistry
 
 
 class SampleTool(Tool):
@@ -84,6 +84,23 @@ class UnionTool(Tool):
         return "ok"
 
 
+class FailingTool(Tool):
+    @property
+    def name(self) -> str:
+        return "fail"
+
+    @property
+    def description(self) -> str:
+        return "tool that raises"
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {"type": "object"}
+
+    async def execute(self, **kwargs: Any) -> str:
+        raise RuntimeError("boom")
+
+
 def test_validate_params_missing_required() -> None:
     tool = SampleTool()
     errors = tool.validate_params({"query": "hi"})
@@ -130,7 +147,25 @@ async def test_registry_returns_validation_error() -> None:
     reg = ToolRegistry()
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
-    assert "Invalid parameters" in result
+    assert result.status is ToolExecutionStatus.VALIDATION_ERROR
+    assert "Invalid parameters" in result.message
+
+
+@pytest.mark.asyncio
+async def test_registry_reports_missing_tool() -> None:
+    reg = ToolRegistry()
+    result = await reg.execute("unknown", {})
+    assert result.status is ToolExecutionStatus.TOOL_NOT_FOUND
+    assert result.message.startswith("STATUS: FAILED")
+
+
+@pytest.mark.asyncio
+async def test_registry_reports_execution_error() -> None:
+    reg = ToolRegistry()
+    reg.register(FailingTool())
+    result = await reg.execute("fail", {})
+    assert result.status is ToolExecutionStatus.EXECUTION_ERROR
+    assert result.message.startswith("STATUS: FAILED")
 
 
 def test_union_type_validation_supports_multiple_candidates() -> None:

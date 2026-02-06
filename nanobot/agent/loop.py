@@ -1,6 +1,5 @@
 """Agent loop: the core processing engine."""
 
-import asyncio
 import json
 from collections import OrderedDict
 from pathlib import Path
@@ -110,7 +109,7 @@ class AgentLoop:
         steps = strategy if strategy else ["No steps defined."]
         steps_text = "\n".join(f"- {step}" for step in steps)
         return (
-            "## OPERATIONAL PLAN (IMMUTABLE)\n"
+            "## OPERATIONAL PLAN (MANAGED VIA update_plan)\n"
             f"GOAL: {goal_text}\n"
             "STEPS:\n"
             f"{steps_text}"
@@ -160,36 +159,46 @@ class AgentLoop:
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
+        if self._running:
+            logger.warning("Agent loop already running")
+            return
+
         self._running = True
         logger.info("Agent loop started")
 
-        while self._running:
-            try:
-                # Wait for next message
-                msg = await asyncio.wait_for(
-                    self.bus.consume_inbound(),
-                    timeout=1.0
-                )
+        try:
+            while self._running:
+                inbound = await self.bus.consume_inbound()
+                if inbound is None:
+                    logger.info("Agent loop received shutdown signal")
+                    break
 
-                # Process it
                 try:
-                    response = await self._process_message(msg)
+                    response = await self._process_message(inbound)
                     if response:
                         await self.bus.publish_outbound(response)
-                except Exception as e:
-                    logger.error(f"Error processing message: {e}")
-                    # Send error response
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
-                    ))
-            except asyncio.TimeoutError:
-                continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"Error processing message: {exc}")
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=inbound.channel,
+                            chat_id=inbound.chat_id,
+                            content=("Sorry, I encountered an error: " f"{str(exc)}"),
+                        )
+                    )
+        finally:
+            self._running = False
+            logger.info("Agent loop stopped")
 
     def stop(self) -> None:
         """Stop the agent loop."""
+        if not self._running:
+            self.bus.stop()
+            logger.info("Agent loop stopping")
+            return
+
         self._running = False
+        self.bus.stop()
         logger.info("Agent loop stopping")
 
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -235,7 +244,7 @@ class AgentLoop:
                 if draft and draft.content:
                     parsed_plan = parse_llm_json(draft.content)
                     if isinstance(parsed_plan, dict):
-                        plan = parsed_plan
+                        plan = cast(dict[str, Any], parsed_plan)
 
                     strategy_steps = self._normalize_strategy(plan.get("strategy"))
                     plan["strategy"] = strategy_steps
@@ -250,7 +259,7 @@ class AgentLoop:
         # --- PHASE 2: EXECUTION ---
         iteration = 0
 
-        # Build the base messages, including the immutable plan (if any), once.
+        # Build the base messages, including the managed plan (if any), once.
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
@@ -320,25 +329,26 @@ class AgentLoop:
 
                     if safety_err and not is_forced:
                         # BLOCK ACTION
-                        result = (
+                        result_text = (
                             f"{safety_err}\n\n"
                             "ESCAPE HATCH: Retry with 'force': true and a 'reason' "
                             "if you are certain this is necessary."
                         )
                     else:
                         # ALLOW ACTION
-                        result = await self.tools.execute(tool.name, tool.arguments)
+                        execution = await self.tools.execute(tool.name, tool.arguments)
+                        result_text = execution.message
 
                     # --- REFLECTION TRIGGER ---
-                    if result.startswith(STATUS_FAILED):
-                        result += (
+                    if result_text.startswith(STATUS_FAILED):
+                        result_text += (
                             "\n\n[SYSTEM INTERVENTION]\n"
                             "PROTOCOL: STOP. Do not retry identical command.\n"
                             "ACTION: Analyze failure -> Update Plan -> Retry."
                         )
 
                     messages = self.context.add_tool_result(
-                        messages, tool.id, tool.name, result
+                        messages, tool.id, tool.name, result_text
                     )
             else:
                 final_content = response.content
@@ -428,9 +438,14 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments)
                     logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    execution = await self.tools.execute(
+                        tool_call.name, tool_call.arguments
+                    )
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages,
+                        tool_call.id,
+                        tool_call.name,
+                        execution.message,
                     )
             else:
                 final_content = response.content

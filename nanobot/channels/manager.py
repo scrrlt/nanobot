@@ -14,24 +14,24 @@ from nanobot.config.schema import Config
 class ChannelManager:
     """
     Manages chat channels and coordinates message routing.
-    
+
     Responsibilities:
     - Initialize enabled channels (Telegram, WhatsApp, etc.)
     - Start/stop channels
     - Route outbound messages
     """
-    
+
     def __init__(self, config: Config, bus: MessageBus):
         self.config = config
         self.bus = bus
         self.channels: dict[str, BaseChannel] = {}
-        self._dispatch_task: asyncio.Task | None = None
-        
+        self._dispatch_task: asyncio.Task[Any] | None = None
+
         self._init_channels()
-    
+
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
-        
+
         # Telegram channel
         if self.config.channels.telegram.enabled:
             try:
@@ -44,7 +44,7 @@ class ChannelManager:
                 logger.info("Telegram channel enabled")
             except ImportError as e:
                 logger.warning(f"Telegram channel not available: {e}")
-        
+
         # WhatsApp channel
         if self.config.channels.whatsapp.enabled:
             try:
@@ -66,7 +66,7 @@ class ChannelManager:
                 logger.info("Discord channel enabled")
             except ImportError as e:
                 logger.warning(f"Discord channel not available: {e}")
-        
+
         # Feishu channel
         if self.config.channels.feishu.enabled:
             try:
@@ -77,37 +77,39 @@ class ChannelManager:
                 logger.info("Feishu channel enabled")
             except ImportError as e:
                 logger.warning(f"Feishu channel not available: {e}")
-    
+
     async def start_all(self) -> None:
-        """Start WhatsApp channel and the outbound dispatcher."""
+        """Start all enabled channels and the outbound dispatcher."""
         if not self.channels:
             logger.warning("No channels enabled")
             return
-        
+
         # Start outbound dispatcher
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
-        
-        # Start WhatsApp channel
+
+        # Start enabled channels
         tasks = []
         for name, channel in self.channels.items():
             logger.info(f"Starting {name} channel...")
             tasks.append(asyncio.create_task(channel.start()))
-        
+
         # Wait for all to complete (they should run forever)
         await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     async def stop_all(self) -> None:
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")
-        
-        # Stop dispatcher
-        if self._dispatch_task:
-            self._dispatch_task.cancel()
+
+        # Stop dispatcher task
+        dispatch_task = self._dispatch_task
+        if dispatch_task is not None:
             try:
-                await self._dispatch_task
+                await dispatch_task
             except asyncio.CancelledError:
-                pass
-        
+                logger.debug("Outbound dispatcher task cancelled during shutdown")
+            finally:
+                self._dispatch_task = None
+
         # Stop all channels
         for name, channel in self.channels.items():
             try:
@@ -115,36 +117,38 @@ class ChannelManager:
                 logger.info(f"Stopped {name} channel")
             except Exception as e:
                 logger.error(f"Error stopping {name}: {e}")
-    
+
+        # Signal bus shutdown once channels have drained
+        self.bus.stop()
+
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
         logger.info("Outbound dispatcher started")
-        
+
         while True:
             try:
-                msg = await asyncio.wait_for(
-                    self.bus.consume_outbound(),
-                    timeout=1.0
-                )
-                
-                channel = self.channels.get(msg.channel)
-                if channel:
-                    try:
-                        await channel.send(msg)
-                    except Exception as e:
-                        logger.error(f"Error sending to {msg.channel}: {e}")
-                else:
-                    logger.warning(f"Unknown channel: {msg.channel}")
-                    
-            except asyncio.TimeoutError:
-                continue
+                message = await self.bus.consume_outbound()
             except asyncio.CancelledError:
+                logger.debug("Outbound dispatcher cancelled")
                 break
-    
+
+            if message is None:
+                logger.info("Outbound dispatcher received shutdown signal")
+                break
+
+            channel = self.channels.get(message.channel)
+            if channel:
+                try:
+                    await channel.send(message)
+                except Exception as exc:
+                    logger.error(f"Error sending to {message.channel}: {exc}")
+            else:
+                logger.warning(f"Unknown channel: {message.channel}")
+
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
         return self.channels.get(name)
-    
+
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {
@@ -154,7 +158,7 @@ class ChannelManager:
             }
             for name, channel in self.channels.items()
         }
-    
+
     @property
     def enabled_channels(self) -> list[str]:
         """Get list of enabled channel names."""

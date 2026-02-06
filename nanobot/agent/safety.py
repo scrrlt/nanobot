@@ -1,7 +1,8 @@
-from collections import deque
-from pathlib import Path
 import json
 import re
+from collections import deque
+from pathlib import Path
+from typing import Any
 
 
 class OscillationDetector:
@@ -23,7 +24,7 @@ class OscillationDetector:
             "pip install",
         ]
 
-    def normalize_args(self, tool_name: str, args: dict) -> str:
+    def normalize_args(self, tool_name: str, args: dict[str, Any]) -> str:
         """Resolves relative paths to absolute to prevent syntax evasion."""
         normalized = args.copy()
         if tool_name == "exec" and "command" in normalized:
@@ -39,7 +40,7 @@ class OscillationDetector:
             normalized["command"] = re.sub(r"\.{1,2}/[^\s]+", resolve, cmd)
         return json.dumps(normalized, sort_keys=True)
 
-    def check(self, tool_name: str, args: dict) -> str | None:
+    def check(self, tool_name: str, args: dict[str, Any]) -> str | None:
         """Returns error message if unsafe, else None."""
         # 1. Check for State-Breaking (Write) Action
         is_write = (tool_name in self.write_tools) or (

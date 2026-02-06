@@ -1,81 +1,117 @@
 """Async message queue for decoupled channel-agent communication."""
 
 import asyncio
-from typing import Callable, Awaitable
+from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 
 
+@dataclass(frozen=True)
+class _InboundShutdown:
+    """Sentinel signalling that the inbound queue should shut down."""
+
+
+@dataclass(frozen=True)
+class _OutboundShutdown:
+    """Sentinel signalling that the outbound queue should shut down."""
+
+
+InboundQueueItem = InboundMessage | _InboundShutdown
+OutboundQueueItem = OutboundMessage | _OutboundShutdown
+
+
 class MessageBus:
-    """
-    Async message bus that decouples chat channels from the agent core.
-    
-    Channels push messages to the inbound queue, and the agent processes
-    them and pushes responses to the outbound queue.
-    """
-    
-    def __init__(self):
-        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
-        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+    """Async message bus that decouples chat channels from the agent core."""
+
+    def __init__(self) -> None:
+        self.inbound: asyncio.Queue[InboundQueueItem] = asyncio.Queue()
+        self.outbound: asyncio.Queue[OutboundQueueItem] = asyncio.Queue()
         self._outbound_subscribers: dict[str, list[Callable[[OutboundMessage], Awaitable[None]]]] = {}
-        self._running = False
-    
+        self._dead_letters: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+        self._inbound_shutdown_requested = False
+        self._outbound_shutdown_requested = False
+
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
+        if self._inbound_shutdown_requested:
+            logger.warning("Inbound message dropped during shutdown: %s", msg)
+            return
         await self.inbound.put(msg)
-    
-    async def consume_inbound(self) -> InboundMessage:
-        """Consume the next inbound message (blocks until available)."""
-        return await self.inbound.get()
-    
+
+    async def consume_inbound(self) -> InboundMessage | None:
+        """Consume the next inbound message.
+
+        Returns ``None`` once shutdown has been requested.
+        """
+        item = await self.inbound.get()
+        if isinstance(item, _InboundShutdown):
+            return None
+        return item
+
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
+        if self._outbound_shutdown_requested:
+            logger.warning("Outbound message dropped during shutdown: %s", msg)
+            return
         await self.outbound.put(msg)
-    
-    async def consume_outbound(self) -> OutboundMessage:
-        """Consume the next outbound message (blocks until available)."""
-        return await self.outbound.get()
-    
+
+    async def consume_outbound(self) -> OutboundMessage | None:
+        """Consume the next outbound message.
+
+        Returns ``None`` once shutdown has been requested.
+        """
+        item = await self.outbound.get()
+        if isinstance(item, _OutboundShutdown):
+            return None
+        return item
+
     def subscribe_outbound(
-        self, 
-        channel: str, 
-        callback: Callable[[OutboundMessage], Awaitable[None]]
+        self,
+        channel: str,
+        callback: Callable[[OutboundMessage], Awaitable[None]],
     ) -> None:
         """Subscribe to outbound messages for a specific channel."""
         if channel not in self._outbound_subscribers:
             self._outbound_subscribers[channel] = []
         self._outbound_subscribers[channel].append(callback)
-    
+
     async def dispatch_outbound(self) -> None:
-        """
-        Dispatch outbound messages to subscribed channels.
-        Run this as a background task.
-        """
-        self._running = True
-        while self._running:
-            try:
-                msg = await asyncio.wait_for(self.outbound.get(), timeout=1.0)
-                subscribers = self._outbound_subscribers.get(msg.channel, [])
-                for callback in subscribers:
-                    try:
-                        await callback(msg)
-                    except Exception as e:
-                        logger.error(f"Error dispatching to {msg.channel}: {e}")
-            except asyncio.TimeoutError:
-                continue
-    
+        """Dispatch outbound messages to subscribed channels."""
+        while True:
+            item = await self.outbound.get()
+            if isinstance(item, _OutboundShutdown):
+                break
+            subscribers = self._outbound_subscribers.get(item.channel, [])
+            for callback in subscribers:
+                try:
+                    await callback(item)
+                except Exception as exc:
+                    logger.error(f"Error dispatching to {item.channel}: {exc}")
+                    await self._dead_letters.put(item)
+
     def stop(self) -> None:
-        """Stop the dispatcher loop."""
-        self._running = False
-    
+        """Signal the dispatcher and consumers to shut down."""
+        if not self._inbound_shutdown_requested:
+            self.inbound.put_nowait(_InboundShutdown())
+            self._inbound_shutdown_requested = True
+        if not self._outbound_shutdown_requested:
+            self.outbound.put_nowait(_OutboundShutdown())
+            self._outbound_shutdown_requested = True
+
     @property
     def inbound_size(self) -> int:
         """Number of pending inbound messages."""
         return self.inbound.qsize()
-    
+
     @property
     def outbound_size(self) -> int:
         """Number of pending outbound messages."""
         return self.outbound.qsize()
+
+    @property
+    def dead_letters(self) -> asyncio.Queue[OutboundMessage]:
+        """Queue containing messages that failed to dispatch."""
+        return self._dead_letters

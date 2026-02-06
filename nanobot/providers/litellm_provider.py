@@ -1,6 +1,6 @@
 """LiteLLM provider implementation for multi-provider support."""
 
-import os
+import json
 from typing import Any
 
 import litellm
@@ -34,28 +34,6 @@ class LiteLLMProvider(LLMProvider):
 
         # Track if using custom endpoint (vLLM, etc.)
         self.is_vllm = bool(api_base) and not self.is_openrouter
-
-        # Configure LiteLLM based on provider
-        if api_key:
-            if self.is_openrouter:
-                # OpenRouter mode - set key
-                os.environ["OPENROUTER_API_KEY"] = api_key
-            elif self.is_vllm:
-                # vLLM/custom endpoint - uses OpenAI-compatible API
-                os.environ["OPENAI_API_KEY"] = api_key
-            elif "anthropic" in default_model:
-                os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
-            elif "openai" in default_model or "gpt" in default_model:
-                os.environ.setdefault("OPENAI_API_KEY", api_key)
-            elif "gemini" in default_model.lower():
-                os.environ.setdefault("GEMINI_API_KEY", api_key)
-            elif "zhipu" in default_model or "glm" in default_model or "zai" in default_model:
-                os.environ.setdefault("ZHIPUAI_API_KEY", api_key)
-            elif "groq" in default_model:
-                os.environ.setdefault("GROQ_API_KEY", api_key)
-
-        if api_base:
-            litellm.api_base = api_base
 
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
@@ -108,20 +86,18 @@ class LiteLLMProvider(LLMProvider):
             else:
                 model = f"hosted_vllm/{model}"
 
-        # For Gemini, ensure gemini/ prefix if not already present.
-        # Some providers alias Gemini models (e.g., "google/gemini-1.5-pro"). We
-        # normalize any identifier containing "gemini" unless it is already
-        # prefixed, to maintain compatibility with LiteLLM routing.
         if "gemini" in model.lower():
             if "/" not in model:
                 model = f"gemini/{model}"
-            elif not model.split("/", 1)[0].lower() in {
-                "gemini",
-                "google",
-                "vertex_ai",
-                "openrouter",
-            }:
-                model = f"gemini/{model}"
+            else:
+                provider_prefix = model.split("/", 1)[0].lower()
+                if provider_prefix not in {
+                    "gemini",
+                    "google",
+                    "vertex_ai",
+                    "openrouter",
+                }:
+                    model = f"gemini/{model}"
 
         kwargs: dict[str, Any] = {
             "model": model,
@@ -130,7 +106,9 @@ class LiteLLMProvider(LLMProvider):
             "temperature": temperature,
         }
 
-        # Pass api_base directly for custom endpoints (vLLM, etc.)
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+
         if self.api_base:
             kwargs["api_base"] = self.api_base
 
@@ -162,7 +140,6 @@ class LiteLLMProvider(LLMProvider):
                 # Parse arguments from JSON string if needed
                 args = tc.function.arguments
                 if isinstance(args, str):
-                    import json
                     try:
                         args = json.loads(args)
                     except json.JSONDecodeError:
