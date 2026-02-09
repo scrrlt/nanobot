@@ -34,7 +34,9 @@ cron(action="remove", job_id="abc123")
 
 | User says | Parameters |
 |-----------|------------|
-| every 20 minutes | every_seconds: 1200 |
-| every hour | every_seconds: 3600 |
-| every day at 8am | cron_expr: "0 8 * * *" |
-| weekdays at 5pm | cron_expr: "0 17 * * 1-5" |
+| every 20 minutes | every_seconds=1200 |
+| every hour | every_seconds=3600 |
+| every day at 8am | cron_expr="0 8 * * *" |
+| weekdays at 5pm | cron_expr="0 17 * * 1-5" |
+
+Use `every_seconds` for fixed intervals, and `cron_expr` when you need specific times or days.

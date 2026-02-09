@@ -88,38 +88,44 @@ class ChannelManager:
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
 
         # Start enabled channels
-        tasks = []
+        task_pairs: list[tuple[str, asyncio.Task[Any]]] = []
         for name, channel in self.channels.items():
             logger.info(f"Starting {name} channel...")
-            tasks.append(asyncio.create_task(channel.start()))
+            task_pairs.append((name, asyncio.create_task(channel.start())))
 
         # Wait for all to complete (they should run forever)
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(
+            *(task for _, task in task_pairs), return_exceptions=True
+        )
+        for (name, _), result in zip(task_pairs, results):
+            if isinstance(result, Exception):
+                logger.opt(exception=result).error("Channel {} task failed", name)
 
     async def stop_all(self) -> None:
         """Stop all channels and the dispatcher."""
         logger.info("Stopping all channels...")
 
-        # Stop dispatcher task
+        # Stop all channels first to prevent new outbound messages
+        for name, channel in self.channels.items():
+            try:
+                await channel.stop()
+                logger.info(f"Stopped {name} channel")
+            except Exception as exc:  # noqa: BLE001
+                logger.opt(exception=exc).error("Error stopping %s", name)
+
+        # Stop dispatcher task after channels have been halted
         dispatch_task = self._dispatch_task
+        self._dispatch_task = None
+        self.bus.stop()
         if dispatch_task is not None:
             try:
                 await dispatch_task
             except asyncio.CancelledError:
                 logger.debug("Outbound dispatcher task cancelled during shutdown")
-            finally:
-                self._dispatch_task = None
-
-        # Stop all channels
-        for name, channel in self.channels.items():
-            try:
-                await channel.stop()
-                logger.info(f"Stopped {name} channel")
-            except Exception as e:
-                logger.error(f"Error stopping {name}: {e}")
-
-        # Signal bus shutdown once channels have drained
-        self.bus.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.opt(exception=exc).error(
+                    "Outbound dispatcher encountered an error during shutdown"
+                )
 
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""

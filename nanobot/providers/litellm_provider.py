@@ -22,6 +22,7 @@ class LiteLLMProvider(LLMProvider):
         api_key: str | None = None,
         api_base: str | None = None,
         default_model: str = "anthropic/claude-opus-4-5",
+        use_vllm_prefix: bool = False,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
@@ -32,8 +33,8 @@ class LiteLLMProvider(LLMProvider):
             (api_base and "openrouter" in api_base)
         )
 
-        # Track if using custom endpoint (vLLM, etc.)
-        self.is_vllm = bool(api_base) and not self.is_openrouter
+        # Track if using hosted vLLM prefixing
+        self.use_vllm_prefix = use_vllm_prefix
 
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
@@ -77,12 +78,11 @@ class LiteLLMProvider(LLMProvider):
             model = f"zai/{model}"
 
         # For vLLM, use hosted_vllm/ prefix per LiteLLM docs
-        # Convert openai/ prefix to hosted_vllm/ if user specified it
-        if self.is_vllm:
-            if model.startswith("hosted_vllm/"):
-                pass
-            elif model.startswith("openai/"):
-                model = f"hosted_vllm/{model.removeprefix('openai/')}"
+        # Normalize any provider prefix (e.g., openai/, anthropic/) to hosted_vllm/
+        if self.use_vllm_prefix and not model.startswith("hosted_vllm/"):
+            if "/" in model:
+                _, suffix = model.split("/", 1)
+                model = f"hosted_vllm/{suffix}"
             else:
                 model = f"hosted_vllm/{model}"
 
@@ -134,7 +134,7 @@ class LiteLLMProvider(LLMProvider):
         choice = response.choices[0]
         message = choice.message
 
-        tool_calls = []
+        tool_calls: list[ToolCallRequest] = []
         if hasattr(message, "tool_calls") and message.tool_calls:
             for tc in message.tool_calls:
                 # Parse arguments from JSON string if needed

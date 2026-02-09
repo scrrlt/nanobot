@@ -81,6 +81,9 @@ class Tool(ABC):
             error = f"{label} should match one of types: {allowed}"
             return [error, *first_failure]
 
+        if schema_type in ("integer", "number") and isinstance(val, bool):
+            return [f"{label} should be {schema_type}"]
+
         if schema_type in self._TYPE_MAP and not isinstance(
             val, self._TYPE_MAP[schema_type]
         ):

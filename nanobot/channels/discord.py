@@ -2,9 +2,10 @@
 
 import asyncio
 import json
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
+import aiofiles
 import httpx
 import websockets
 from loguru import logger
@@ -88,22 +89,68 @@ class DiscordChannel(BaseChannel):
         headers = {"Authorization": f"Bot {self.config.token}"}
 
         try:
+            backoff = 1.0
+            last_response: httpx.Response | None = None
             for attempt in range(3):
                 try:
                     response = await self._http.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        data = response.json()
-                        retry_after = float(data.get("retry_after", 1.0))
-                        logger.warning(f"Discord rate limited, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    response.raise_for_status()
-                    return
-                except Exception as e:
+                except (asyncio.TimeoutError, httpx.TransportError) as exc:
                     if attempt == 2:
-                        logger.error(f"Error sending Discord message: {e}")
-                    else:
-                        await asyncio.sleep(1)
+                        logger.error(
+                            f"Error sending Discord message after retries: {exc}"
+                        )
+                        break
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"Non-retryable Discord send failure: {exc}")
+                    break
+
+                status = response.status_code
+                last_response = response
+                if 200 <= status < 300:
+                    return
+                if status == 429:
+                    retry_after = 1.0
+                    try:
+                        data = response.json()
+                        retry_after = float(data.get("retry_after", retry_after))
+                    except (ValueError, json.JSONDecodeError, TypeError):
+                        logger.debug(
+                            f"Failed to parse retry_after from Discord response: {response.text}"
+                        )
+                    logger.warning(
+                        f"Discord rate limited, retrying in {retry_after:.1f}s"
+                    )
+                    if attempt == 2:
+                        logger.error(
+                            f"Discord rate limited after retries (429): {response.text}"
+                        )
+                        break
+                    await asyncio.sleep(retry_after)
+                    continue
+                if 500 <= status < 600:
+                    if attempt == 2:
+                        logger.error(f"Discord server error {status}: {response.text}")
+                        break
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                    continue
+                if 400 <= status < 500:
+                    logger.error(
+                        f"Discord rejected message ({status}): {response.text}"
+                    )
+                    break
+                logger.error(
+                    f"Unexpected Discord response status {status}: {response.text}"
+                )
+                break
+
+            error_status = last_response.status_code if last_response else "unknown"
+            raise RuntimeError(
+                f"Failed to send Discord message after retries (status {error_status})"
+            )
         finally:
             await self._stop_typing(msg.chat_id)
 
@@ -203,24 +250,49 @@ class DiscordChannel(BaseChannel):
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")
-            filename = attachment.get("filename") or "attachment"
+            raw_filename = attachment.get("filename") or "attachment"
             size = attachment.get("size") or 0
             if not url or not self._http:
                 continue
             if size and size > MAX_ATTACHMENT_BYTES:
-                content_parts.append(f"[attachment: {filename} - too large]")
+                content_parts.append(f"[attachment: {raw_filename} - too large]")
                 continue
+
+            candidate_name = PurePath(raw_filename).name.replace("\x00", "")
+            safe_name = "".join(
+                char
+                for char in candidate_name
+                if char.isalnum() or char in {"-", "_", "."}
+            )
+            if not safe_name:
+                safe_name = str(attachment.get("id", "file"))
+            final_name = f"{attachment.get('id', 'file')}_{safe_name}"
+            file_path = media_dir / final_name
+
             try:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
-                resp = await self._http.get(url)
-                resp.raise_for_status()
-                file_path.write_bytes(resp.content)
+                async with self._http.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    try:
+                        async with aiofiles.open(file_path, "wb") as file_obj:
+                            bytes_written = 0
+                            async for chunk in resp.aiter_bytes():
+                                if not chunk:
+                                    continue
+                                bytes_written += len(chunk)
+                                if bytes_written > MAX_ATTACHMENT_BYTES:
+                                    raise ValueError(
+                                        "Attachment exceeds maximum allowed size"
+                                    )
+                                await file_obj.write(chunk)
+                    except Exception:
+                        file_path.unlink(missing_ok=True)
+                        raise
                 media_paths.append(str(file_path))
                 content_parts.append(f"[attachment: {file_path}]")
             except Exception as e:
-                logger.warning(f"Failed to download Discord attachment: {e}")
-                content_parts.append(f"[attachment: {filename} - download failed]")
+                logger.opt(exception=e).warning("Failed to download Discord attachment")
+                content_parts.append(f"[attachment: {safe_name} - download failed]")
 
         reply_to = (payload.get("referenced_message") or {}).get("id")
 
@@ -247,9 +319,14 @@ class DiscordChannel(BaseChannel):
             headers = {"Authorization": f"Bot {self.config.token}"}
             while self._running:
                 try:
-                    await self._http.post(url, headers=headers)
+                    client = self._http
+                    if client is None:
+                        break
+                    await client.post(url, headers=headers)
                 except Exception:
-                    pass
+                    if not self._running:
+                        break
+                    logger.opt(exception=True).debug("Typing indicator request failed")
                 await asyncio.sleep(8)
 
         self._typing_tasks[channel_id] = asyncio.create_task(typing_loop())

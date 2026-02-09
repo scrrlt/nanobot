@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import typer
 from rich.console import Console
@@ -18,6 +19,29 @@ app = typer.Typer(
 )
 
 console = Console()
+
+
+def _normalize_endpoint(url: str | None) -> str | None:
+    """Normalize API endpoints for reliable comparisons."""
+
+    if not url:
+        return None
+    trimmed = url.strip()
+    if not trimmed:
+        return None
+    try:
+        parts = urlsplit(trimmed)
+    except ValueError:
+        return trimmed.rstrip("/")
+
+    if not parts.scheme or not parts.netloc:
+        return trimmed.rstrip("/")
+
+    path = parts.path.rstrip("/")
+    normalized = f"{parts.scheme.lower()}://{parts.netloc.lower()}{path}"
+    if parts.query:
+        normalized = f"{normalized}?{parts.query}"
+    return normalized
 
 
 def _load_config_or_exit() -> Config:
@@ -199,10 +223,17 @@ def gateway(
         )
         raise typer.Exit(1)
 
+    normalized_api_base = _normalize_endpoint(api_base)
+    normalized_vllm_base = _normalize_endpoint(config.providers.vllm.api_base)
+    use_vllm_prefix = (
+        bool(normalized_vllm_base) and normalized_api_base == normalized_vllm_base
+    )
+
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model
+        default_model=config.agents.defaults.model,
+        use_vllm_prefix=use_vllm_prefix,
     )
 
     # Create agent
@@ -308,10 +339,17 @@ def agent(
         raise typer.Exit(1)
 
     bus = MessageBus()
+    normalized_api_base = _normalize_endpoint(api_base)
+    normalized_vllm_base = _normalize_endpoint(config.providers.vllm.api_base)
+    use_vllm_prefix = (
+        bool(normalized_vllm_base) and normalized_api_base == normalized_vllm_base
+    )
+
     provider = LiteLLMProvider(
         api_key=api_key,
         api_base=api_base,
-        default_model=config.agents.defaults.model
+        default_model=config.agents.defaults.model,
+        use_vllm_prefix=use_vllm_prefix,
     )
 
     agent_loop = AgentLoop(

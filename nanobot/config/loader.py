@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from nanobot.config.schema import Config
 
 
@@ -39,7 +41,7 @@ def load_config(config_path: Path | None = None) -> Config:
             with open(path, encoding="utf-8") as file:
                 data = json.load(file)
             return Config.model_validate(convert_keys(data))
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, ValidationError) as exc:
             raise ConfigLoadError(f"Failed to load config from {path}: {exc}") from exc
 
     return Config()

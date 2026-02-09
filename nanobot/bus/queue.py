@@ -82,15 +82,27 @@ class MessageBus:
         """Dispatch outbound messages to subscribed channels."""
         while True:
             item = await self.outbound.get()
-            if isinstance(item, _OutboundShutdown):
+            is_shutdown = isinstance(item, _OutboundShutdown)
+            try:
+                if not is_shutdown:
+                    subscribers = self._outbound_subscribers.get(item.channel, [])
+                    dead_lettered = False
+                    for callback in subscribers:
+                        try:
+                            await callback(item)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error(
+                                "Error dispatching to %s: %s",
+                                item.channel,
+                                exc,
+                            )
+                            if not dead_lettered:
+                                await self._dead_letters.put(item)
+                                dead_lettered = True
+            finally:
+                self.outbound.task_done()
+            if is_shutdown:
                 break
-            subscribers = self._outbound_subscribers.get(item.channel, [])
-            for callback in subscribers:
-                try:
-                    await callback(item)
-                except Exception as exc:
-                    logger.error(f"Error dispatching to {item.channel}: {exc}")
-                    await self._dead_letters.put(item)
 
     def stop(self) -> None:
         """Signal the dispatcher and consumers to shut down."""
