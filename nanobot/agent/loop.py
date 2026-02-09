@@ -25,9 +25,12 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.tools.cron import CronTool
+from nanobot.config.schema import ExecToolConfig
+from nanobot.cron.service import CronService
+
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import ExecToolConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import SessionManager
 from nanobot.utils.parsing import parse_llm_json
@@ -60,6 +63,9 @@ class AgentLoop:
         max_iterations: int = 20,
         brave_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        cron_service: CronService | None = None,
+        restrict_to_workspace: bool = False,
+        session_manager: SessionManager | None = None,
     ):
         """
         Initialize the AgentLoop.
@@ -74,6 +80,9 @@ class AgentLoop:
             max_iterations: Max tool execution iterations per message.
             brave_api_key: API key for Brave Search.
             exec_config: Configuration for the shell execution tool.
+            cron_service: The cron service for scheduled tasks.
+            restrict_to_workspace: Restrict file operations to workspace.
+            session_manager: The session manager.
         """
         self.bus = bus
         self.provider = provider
@@ -83,12 +92,15 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
+        self.cron_service = cron_service
+        self.restrict_to_workspace = restrict_to_workspace
+        
         self.oscillation_detectors: OrderedDict[str, OscillationDetector] = (
             OrderedDict()
         )
 
         self.context = ContextBuilder(workspace)
-        self.sessions = SessionManager(workspace)
+        self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -97,6 +109,7 @@ class AgentLoop:
             model=self.model,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
+            restrict_to_workspace=restrict_to_workspace,
         )
 
         self._running = False
@@ -129,17 +142,18 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
-        # File tools
-        self.tools.register(ReadFileTool())
-        self.tools.register(WriteFileTool())
-        self.tools.register(EditFileTool())
-        self.tools.register(ListDirTool())
+        # File tools (restrict to workspace if configured)
+        allowed_dir = self.workspace if self.restrict_to_workspace else None
+        self.tools.register(ReadFileTool(allowed_dir=allowed_dir))
+        self.tools.register(WriteFileTool(allowed_dir=allowed_dir))
+        self.tools.register(EditFileTool(allowed_dir=allowed_dir))
+        self.tools.register(ListDirTool(allowed_dir=allowed_dir))
 
         # Shell tool
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
-            restrict_to_workspace=self.exec_config.restrict_to_workspace,
+            restrict_to_workspace=self.restrict_to_workspace,
         ))
 
         # Web tools
@@ -156,6 +170,10 @@ class AgentLoop:
 
         # Planning tool
         self.tools.register(UpdatePlanTool())
+        
+        # Cron tool (for scheduling)
+        if self.cron_service:
+            self.tools.register(CronTool(self.cron_service))
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -202,7 +220,28 @@ class AgentLoop:
         logger.info("Agent loop stopping")
 
     async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+        # Handle system messages (subagent announces)
+        if msg.channel == "system":
+            return await self._process_system_message(msg)
+
         session = self.sessions.get_or_create(msg.session_key)
+        
+        # Log preview
+        preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
+        logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
+
+        # Update tool contexts
+        message_tool = self.tools.get("message")
+        if isinstance(message_tool, MessageTool):
+            message_tool.set_context(msg.channel, msg.chat_id)
+        
+        spawn_tool = self.tools.get("spawn")
+        if isinstance(spawn_tool, SpawnTool):
+            spawn_tool.set_context(msg.channel, msg.chat_id)
+        
+        cron_tool = self.tools.get("cron")
+        if isinstance(cron_tool, CronTool):
+            cron_tool.set_context(msg.channel, msg.chat_id)
 
         if msg.session_key not in self.oscillation_detectors:
             # Clean up old detectors if at capacity
@@ -263,7 +302,10 @@ class AgentLoop:
         messages = self.context.build_messages(
             history=session.get_history(),
             current_message=msg.content,
+            media=msg.media if msg.media else None,
             system_suffix=active_plan,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
         )
         final_content = None
 
@@ -290,7 +332,8 @@ class AgentLoop:
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages, response.content, tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
                 )
 
                 for tool in response.tool_calls:
@@ -336,8 +379,12 @@ class AgentLoop:
                         )
                     else:
                         # ALLOW ACTION
+                        # Log tool execution
+                        args_str = json.dumps(tool.arguments, ensure_ascii=False)
+                        logger.info(f"Tool call: {tool.name}({args_str[:200]})")
+                        
                         execution = await self.tools.execute(tool.name, tool.arguments)
-                        result_text = execution.message
+                        result_text = execution.message if hasattr(execution, 'message') else str(execution)
 
                     # --- REFLECTION TRIGGER ---
                     if result_text.startswith(STATUS_FAILED):
@@ -357,6 +404,10 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
+        # Log response preview
+        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+        logger.info(f"Response to {msg.channel}:{msg.sender_id}: {preview}")
+
         # Save to session
         session.add_message("user", msg.content)
         session.add_message("assistant", final_content)
@@ -365,7 +416,8 @@ class AgentLoop:
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
-            content=final_content
+            content=final_content,
+            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
         )
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -400,10 +452,16 @@ class AgentLoop:
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(origin_channel, origin_chat_id)
 
+        cron_tool = self.tools.get("cron")
+        if isinstance(cron_tool, CronTool):
+            cron_tool.set_context(origin_channel, origin_chat_id)
+
         # Build messages with the announce content
         messages = self.context.build_messages(
             history=session.get_history(),
-            current_message=msg.content
+            current_message=msg.content,
+            channel=origin_channel,
+            chat_id=origin_chat_id,
         )
 
         # Agent loop (limited for announce handling)
@@ -432,20 +490,25 @@ class AgentLoop:
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts
+                    messages, response.content, tool_call_dicts,
+                    reasoning_content=response.reasoning_content,
                 )
 
                 for tool_call in response.tool_calls:
-                    args_str = json.dumps(tool_call.arguments)
-                    logger.debug(f"Executing tool: {tool_call.name} with arguments: {args_str}")
+                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
+                    
                     execution = await self.tools.execute(
                         tool_call.name, tool_call.arguments
                     )
+                    
+                    result_text = execution.message if hasattr(execution, 'message') else str(execution)
+                    
                     messages = self.context.add_tool_result(
                         messages,
                         tool_call.id,
                         tool_call.name,
-                        execution.message,
+                        result_text,
                     )
             else:
                 final_content = response.content
@@ -465,20 +528,27 @@ class AgentLoop:
             content=final_content
         )
 
-    async def process_direct(self, content: str, session_key: str = "cli:direct") -> str:
+    async def process_direct(
+        self,
+        content: str,
+        session_key: str = "cli:direct",
+        channel: str = "cli",
+        chat_id: str = "direct",
+    ) -> str:
         """
-        Process a message directly (for CLI usage).
+        Process a message directly (for CLI or cron usage).
 
         Args:
             content: The message content.
             session_key: Session identifier.
+            channel: Source channel (for context).
+            chat_id: Source chat ID (for context).
 
         Returns:
             The agent's response.
         """
-        channel = "cli"
-        chat_id = "direct"
-        if session_key:
+        
+        if session_key and not (channel and chat_id != "direct"):
             if ":" in session_key:
                 channel, chat_id = session_key.split(":", 1)
             else:
