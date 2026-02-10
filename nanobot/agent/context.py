@@ -146,7 +146,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         prompt = base_prompt
         if system_suffix:
             prompt += f"\n\n{system_suffix}"  # Append Plan
-        
+
         if channel and chat_id:
             prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
 
