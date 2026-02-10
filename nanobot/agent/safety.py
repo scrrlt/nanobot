@@ -25,6 +25,9 @@ class OscillationDetector:
             "pip install",
         ]
         self._write_cmd_patterns = [cmd.lower().split() for cmd in self.write_cmds]
+        # Flag set when a state-changing action just occurred; used to suppress
+        # premature oscillation detection immediately after a write.
+        self._just_wrote = False
 
     def _extract_command_tokens(self, tokens: list[str]) -> list[str]:
         """Normalize command tokens by removing wrappers and returning lowercase tokens."""
@@ -103,10 +106,13 @@ class OscillationDetector:
         return [tok.lower() for tok in filtered_tokens]
 
     def normalize_args(self, tool_name: str, args: dict[str, Any]) -> str:
-        """Resolves relative paths to absolute to prevent syntax evasion."""
+        """Resolves relative paths to absolute to prevent syntax evasion.
+
+        Normalizes Windows paths to a canonical, POSIX-like form (forward slashes,
+        no drive letter) to ensure consistent signatures across platforms.
+        """
         normalized = args.copy()
         if tool_name == "exec" and "command" in normalized:
-            # Simple heuristic to resolve ./ paths
             cmd = normalized["command"]
 
             def resolve(m: re.Match[str]) -> str:
@@ -115,14 +121,29 @@ class OscillationDetector:
                 except Exception:
                     return m.group(0)
 
-            normalized["command"] = re.sub(r"\.{1,2}/[^\s]+", resolve, cmd)
+            # Resolve relative ./ and ../ paths
+            resolved = re.sub(r"\.{1,2}/[^\s]+", resolve, cmd)
+
+            # Normalize path separators to forward slashes
+            resolved = resolved.replace("\\", "/")
+
+            # Remove Windows drive letters (e.g., C:/path -> /path)
+            resolved = re.sub(r"(?i)[A-Za-z]:/", "/", resolved)
+
+            # Collapse duplicate slashes
+            resolved = re.sub(r"/{2,}", "/", resolved)
+
+            normalized["command"] = resolved
+
         return json.dumps(normalized, sort_keys=True)
 
     def check(self, tool_name: str, args: dict[str, Any]) -> str | None:
         """Returns error message if unsafe, else None."""
         # 1. Check for State-Breaking (Write) Action
-        is_write = tool_name in self.write_tools
+        write_cmd_first = {cmd.split()[0] for cmd in self.write_cmds}
+        is_write = tool_name in self.write_tools or tool_name in write_cmd_first
 
+        # If it's an exec command, perform tokenized detection against write patterns
         if not is_write and tool_name == "exec":
             command_value = args.get("command")
             if isinstance(command_value, str):
@@ -141,26 +162,40 @@ class OscillationDetector:
                         break
 
                 if not is_write:
-                    lowered_command = command_value.lower()
-                    for pattern in self._write_cmd_patterns:
-                        pattern_str = " ".join(pattern)
-                        if pattern_str and pattern_str in lowered_command:
+                    lowered_command = command_value.lower().replace("\\", "/")
+                    # Check for base write tokens in the string
+                    for base in write_cmd_first:
+                        if f"{base}/" in lowered_command or f" {base} " in lowered_command:
                             is_write = True
                             break
 
         if is_write:
-            self.history.clear()  # Environment changed, reset read history
+            # Environment changed: reset read history and mark recent write
+            self.history.clear()
+            self._just_wrote = True
             return None
 
         # 2. Check for Read-Only Oscillation
         sig = f"{tool_name}:{self.normalize_args(tool_name, args)}"
         self.history.append(sig)
 
-        if self.history.count(sig) >= self.threshold:
-            return (
-                "STATUS: OSCILLATION DETECTED\n"
-                "SYSTEM ALERT: You are checking the same state repeatedly without changing it.\n"
-                "PROTOCOL: Perform a write action, change your query, or retry "
-                "with force=true and a reason."
-            )
+        # If a write just occurred, suppress premature detection until we've
+        # collected more than `threshold` entries after the write.
+        if self._just_wrote:
+            if len(self.history) <= self.threshold:
+                return None
+            else:
+                # We've passed the initial grace period; clear the flag and continue
+                self._just_wrote = False
+
+        # Trigger when the last `threshold` entries are identical to this signature
+        if len(self.history) >= self.threshold:
+            recent = list(self.history)[-self.threshold:]
+            if all(entry == sig for entry in recent):
+                return (
+                    "STATUS: OSCILLATION DETECTED\n"
+                    "SYSTEM ALERT: You are checking the same state repeatedly without changing it.\n"
+                    "PROTOCOL: Perform a write action, change your query, or retry "
+                    "with force=true and a reason."
+                )
         return None
