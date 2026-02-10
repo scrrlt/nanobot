@@ -135,43 +135,49 @@ class Tool(ABC):
                 errors.extend(self._validate(item, items_schema, child_path))
 
         any_of = schema.get("anyOf")
-        if any_of:
-            matched_any = False
-            option_messages: list[str] = []
-            for variant in any_of:
-                variant_errors = self._validate(val, variant, path)
-                if not variant_errors:
-                    matched_any = True
-                    break
-                option_messages.append(", ".join(variant_errors))
-            if not matched_any:
-                detail = "; ".join(msg for msg in option_messages if msg)
-                message = f"{label} did not match any allowed schema option (anyOf)"
-                if detail:
-                    message = f"{message}: {detail}"
-                errors.append(message)
+        if any_of is not None:
+            if isinstance(any_of, list):
+                matched_any = False
+                option_messages: list[str] = []
+                for variant in any_of:
+                    variant_errors = self._validate(val, variant, path)
+                    if not variant_errors:
+                        matched_any = True
+                        break
+                    option_messages.append(", ".join(variant_errors))
+                if not matched_any:
+                    detail = "; ".join(msg for msg in option_messages if msg)
+                    message = f"{label} did not match any allowed schema option (anyOf)"
+                    if detail:
+                        message = f"{message}: {detail}"
+                    errors.append(message)
+            else:
+                errors.append(f"{label} has malformed anyOf: expected a list")
 
         one_of = schema.get("oneOf")
-        if one_of:
-            match_count = 0
-            mismatch_details: list[str] = []
-            for variant in one_of:
-                variant_errors = self._validate(val, variant, path)
-                if not variant_errors:
-                    match_count += 1
-                else:
-                    mismatch_details.append(", ".join(variant_errors))
-            if match_count == 0:
-                detail = "; ".join(msg for msg in mismatch_details if msg)
-                message = f"{label} did not match any allowed schema option (oneOf)"
-                if detail:
-                    message = f"{message}: {detail}"
-                errors.append(message)
-            elif match_count > 1:
-                errors.append(
-                    f"{label} matches multiple schema options but oneOf expects "
-                    "exactly one"
-                )
+        if one_of is not None:
+            if isinstance(one_of, list):
+                match_count = 0
+                mismatch_details: list[str] = []
+                for variant in one_of:
+                    variant_errors = self._validate(val, variant, path)
+                    if not variant_errors:
+                        match_count += 1
+                    else:
+                        mismatch_details.append(", ".join(variant_errors))
+                if match_count == 0:
+                    detail = "; ".join(msg for msg in mismatch_details if msg)
+                    message = f"{label} did not match any allowed schema option (oneOf)"
+                    if detail:
+                        message = f"{message}: {detail}"
+                    errors.append(message)
+                elif match_count > 1:
+                    errors.append(
+                        f"{label} matches multiple schema options but oneOf expects "
+                        "exactly one"
+                    )
+            else:
+                errors.append(f"{label} has malformed oneOf: expected a list")
         return errors
 
     def to_schema(self) -> dict[str, Any]:

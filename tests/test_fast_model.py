@@ -79,8 +79,10 @@ async def test_agent_loop_uses_fast_model_when_provided(
 
     # Assert
     assert mock_classify_intent.call_count == 1
-    # Check that classify_intent was called with the fast_model
-    assert mock_classify_intent.call_args[0][2] == "fast/model"
+    # Check that classify_intent was called with the fast_model (kwargs-aware, fallback to positional)
+    call = mock_classify_intent.call_args
+    model_passed = call.kwargs.get("model") if call.kwargs else (call.args[2] if len(call.args) > 2 else None)
+    assert model_passed == "fast/model"
 
     # Check that the drafting call also used the fast_model
     drafting_call = _find_chat_call(mock_provider, response_format=True)
@@ -120,9 +122,10 @@ async def test_agent_loop_falls_back_to_main_model(
     # Assert
     assert agent_loop.fast_model == "primary/model"
     assert mock_classify_intent.call_count == 1
-    # Check that classify_intent was called with the primary model
-    assert mock_classify_intent.call_args[0][2] == "primary/model"
-
+    # Check that classify_intent was called with the primary model (kwargs-aware, fallback to positional)
+    call = mock_classify_intent.call_args
+    model_passed = call.kwargs.get("model") if call.kwargs else (call.args[2] if len(call.args) > 2 else None)
+    assert model_passed == "primary/model"
     # Check that the drafting call also used the primary model
     drafting_call = _find_chat_call(mock_provider, response_format=True)
     assert drafting_call is not None, "Drafting call not found"

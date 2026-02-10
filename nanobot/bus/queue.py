@@ -33,6 +33,8 @@ class MessageBus:
         self._dead_letters: asyncio.Queue[OutboundMessage] = asyncio.Queue()
         self._inbound_shutdown_requested = False
         self._outbound_shutdown_requested = False
+        import threading
+        self._shutdown_lock = threading.Lock()
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
@@ -55,8 +57,8 @@ class MessageBus:
             # Always pair get() with task_done() so inbound.join() does not hang
             try:
                 self.inbound.task_done()
-            except Exception:
-                pass
+            except ValueError as e:
+                logger.debug("Inbound task_done called too many times: %s", e)
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
@@ -79,8 +81,8 @@ class MessageBus:
             # Always pair get() with task_done() so outbound.join() does not hang
             try:
                 self.outbound.task_done()
-            except Exception:
-                pass
+            except ValueError as e:
+                logger.debug("Outbound task_done called too many times: %s", e)
 
     def subscribe_outbound(
         self,
@@ -123,15 +125,19 @@ class MessageBus:
         )
 
     def stop(self) -> None:
-        """Signal the dispatcher and consumers to shut down."""
-        # Flip flags first to avoid a race window where multiple callers enqueue
-        # duplicate shutdown sentinels concurrently.
-        if not self._inbound_shutdown_requested:
-            self._inbound_shutdown_requested = True
-            self.inbound.put_nowait(_InboundShutdown())
-        if not self._outbound_shutdown_requested:
-            self._outbound_shutdown_requested = True
-            self.outbound.put_nowait(_OutboundShutdown())
+        """Signal the dispatcher and consumers to shut down.
+
+        The check-and-set-and-put operation is protected with a simple threading
+        lock to avoid duplicate sentinel enqueueing when stop() is called
+        concurrently.
+        """
+        with self._shutdown_lock:
+            if not self._inbound_shutdown_requested:
+                self._inbound_shutdown_requested = True
+                self.inbound.put_nowait(_InboundShutdown())
+            if not self._outbound_shutdown_requested:
+                self._outbound_shutdown_requested = True
+                self.outbound.put_nowait(_OutboundShutdown())
 
     @property
     def inbound_size(self) -> int:

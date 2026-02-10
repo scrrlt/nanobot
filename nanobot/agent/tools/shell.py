@@ -177,7 +177,13 @@ class ExecTool(Tool):
 
             if is_hard_fail or is_soft_fail:
                 header = STATUS_FAILED
-                body = f"EXIT: {process.returncode}\n{stderr_str or stdout_str}"
+                parts: list[str] = []
+                if stderr_str:
+                    parts.append(f"STDERR:\n{stderr_str}")
+                if stdout_str:
+                    parts.append(f"STDOUT:\n{stdout_str}")
+                body_content = "\n\n".join(parts) if parts else "(No output)"
+                body = f"EXIT: {process.returncode}\n{body_content}"
             else:
                 header = STATUS_SUCCESS
                 body = stdout_str if not is_quiet else "(Success. No output.)"

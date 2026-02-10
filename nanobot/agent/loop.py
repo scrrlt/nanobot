@@ -94,7 +94,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
-        
+
         self.oscillation_detectors: OrderedDict[str, OscillationDetector] = (
             OrderedDict()
         )
@@ -172,7 +172,7 @@ class AgentLoop:
 
         # Planning tool
         self.tools.register(UpdatePlanTool())
-        
+
         # Cron tool (for scheduling)
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -227,7 +227,7 @@ class AgentLoop:
             return await self._process_system_message(msg)
 
         session = self.sessions.get_or_create(msg.session_key)
-        
+
         # Log preview
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
@@ -236,11 +236,11 @@ class AgentLoop:
         message_tool = self.tools.get("message")
         if isinstance(message_tool, MessageTool):
             message_tool.set_context(msg.channel, msg.chat_id)
-        
+
         spawn_tool = self.tools.get("spawn")
         if isinstance(spawn_tool, SpawnTool):
             spawn_tool.set_context(msg.channel, msg.chat_id)
-        
+
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
             cron_tool.set_context(msg.channel, msg.chat_id)
@@ -538,13 +538,73 @@ class AgentLoop:
                 for tool_call in response.tool_calls:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    
-                    execution = await self.tools.execute(
-                        tool_call.name, tool_call.arguments
-                    )
-                    
-                    result_text = execution.message if hasattr(execution, 'message') else str(execution)
-                    
+
+                    # --- SAFETY & OSCILLATION CHECK (system messages) ---
+                    # Ensure we have a safety detector for this origin session
+                    if session_key not in self.oscillation_detectors:
+                        if len(self.oscillation_detectors) >= self.MAX_OSCILLATION_DETECTORS:
+                            self.oscillation_detectors.popitem(last=False)
+                        self.oscillation_detectors[session_key] = OscillationDetector(self.workspace)
+                    else:
+                        self.oscillation_detectors.move_to_end(session_key)
+                    safety_sys = self.oscillation_detectors[session_key]
+
+                    is_forced = bool(tool_call.arguments.get("force", False))
+                    reason = tool_call.arguments.get("reason")
+                    safety_err = safety_sys.check(tool_call.name, tool_call.arguments)
+
+                    if is_forced:
+                        if not isinstance(reason, str) or len(reason.strip()) < 10:
+                            count = self._force_attempts.get(session_key, 0) + 1
+                            self._force_attempts[session_key] = count
+                            logger.warning(
+                                "System message: force attempted without sufficient reason (session=%s tool=%s attempt=%d)",
+                                session_key,
+                                tool_call.name,
+                                count,
+                            )
+                            result_text = (
+                                "Error: 'force' requires a non-empty 'reason' explanation "
+                                "(min 10 characters). Request blocked."
+                            )
+                            messages = self.context.add_tool_result(
+                                messages, tool_call.id, tool_call.name, result_text
+                            )
+                            continue
+
+                    if safety_err and not is_forced:
+                        result_text = (
+                            f"{safety_err}\n\n"
+                            "ESCAPE HATCH: Retry with 'force': true and a 'reason' "
+                            "if you are certain this is necessary."
+                        )
+                        messages = self.context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result_text
+                        )
+                        continue
+
+                    # Execute tool with exception safety
+                    try:
+                        execution = await self.tools.execute(tool_call.name, tool_call.arguments)
+                        result_text = execution.message if hasattr(execution, 'message') else str(execution)
+                    except Exception as exc:
+                        sanitized = f"{type(exc).__name__}: {str(exc)[:200]}"
+                        logger.error(
+                            "System tool execution error (session=%s tool=%s): %s",
+                            session_key,
+                            tool_call.name,
+                            sanitized,
+                        )
+                        result_text = f"{STATUS_FAILED} - Tool execution error: {type(exc).__name__}"
+
+                    # --- REFLECTION TRIGGER ---
+                    if result_text.startswith(STATUS_FAILED):
+                        result_text += (
+                            "\n\n[SYSTEM INTERVENTION]\n"
+                            "PROTOCOL: STOP. Do not retry identical command.\n"
+                            "ACTION: Analyze failure -> Update Plan -> Retry."
+                        )
+
                     messages = self.context.add_tool_result(
                         messages,
                         tool_call.id,
@@ -588,7 +648,7 @@ class AgentLoop:
         Returns:
             The agent's response.
         """
-        
+
         if session_key and not (channel and chat_id != "direct"):
             if ":" in session_key:
                 channel, chat_id = session_key.split(":", 1)

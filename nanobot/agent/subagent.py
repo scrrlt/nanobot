@@ -56,10 +56,11 @@ def _redact_value(value: Any) -> str:
 def _sanitize_exception_text(msg: Any) -> str:
     """Sanitize exception messages by redacting paths/keys and truncating."""
     s = str(msg)
-    # Redact Windows paths
-    s = re.sub(r"[A-Za-z]:\\\\[^\\\s]+", "<REDACTED_PATH>", s)
-    # Redact common Unix paths (best-effort)
-    s = re.sub(r"/[^\s]+", "<REDACTED_PATH>", s)
+    # Redact Windows paths like C:\Users\... (single backslash path separators)
+    s = re.sub(r"[A-Za-z]:\\[^\\\s]+", "<REDACTED_PATH>", s)
+    # Redact forward-slash filesystem paths but avoid URLs (negative lookbehind ensures
+    # the preceding character is not ':' or '/') and match segmented path components
+    s = re.sub(r"(?<![:/])/(?:[\w\-.]+/)*[\w\-.]+", "<REDACTED_PATH>", s)
     # Redact common secret-like key/value pairs
     s = re.sub(
         r"(?i)((?:api[_-]?key|token|password|secret))\s*[:=]\s*[^\s]+",

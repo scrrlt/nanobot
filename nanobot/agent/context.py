@@ -80,8 +80,8 @@ Skills with available="false" need dependencies installed first - you can try in
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
-        # Use a UTF-8-safe header (explicit cat emoji) to avoid encoding errors
-        return f"""# nanobot ??
+        # Use an explicit cat emoji via Unicode escape to ensure robust rendering
+        return f"""# nanobot \U0001F431
 
 You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
 - Read, write, and edit files

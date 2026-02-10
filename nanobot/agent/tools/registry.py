@@ -88,9 +88,11 @@ class ToolRegistry:
                 )
 
             output = await tool.execute(**params)
+            # Ensure message is always a string (defend against tools returning None)
+            msg = "" if output is None else str(output)
             return ToolExecutionResult(
                 status=ToolExecutionStatus.SUCCESS,
-                message=output,
+                message=msg,
             )
         except Exception as exc:  # noqa: BLE001
             return ToolExecutionResult(
