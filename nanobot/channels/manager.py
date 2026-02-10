@@ -186,6 +186,10 @@ class ChannelManager:
                     timeout=1.0
                 )
                 
+                # Shutdown sentinel
+                if msg is None:
+                    break
+
                 channel = self.channels.get(msg.channel)
                 if channel:
                     try:
@@ -194,7 +198,12 @@ class ChannelManager:
                         logger.error(f"Error sending to {msg.channel}: {e}")
                 else:
                     logger.warning(f"Unknown channel: {msg.channel}")
-                    
+
+                # Notify any additional subscribers registered on the bus
+                try:
+                    await self.bus.notify_subscribers(msg)
+                except Exception as exc:
+                    logger.error("Error notifying subscribers: %s", exc)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:

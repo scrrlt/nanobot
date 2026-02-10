@@ -60,14 +60,14 @@ class OscillationDetector:
 
             if lower.startswith("python") or lower in {"pythonw", "pypy"}:
                 # Handle `python -m module` style invocations
-                if idx + 1 < length and tokens[idx + 1] == "-m":
+                if idx + 1 < length and tokens[idx + 1].lower() == "-m":
                     module_idx = idx + 2
                     if module_idx < length:
                         module_and_args = tokens[module_idx:]
                         return [tok.lower() for tok in module_and_args]
                     return []
                 # Handle inline script execution via -c flags
-                if idx + 1 < length and tokens[idx + 1] in {"-c", "-lc"}:
+                if idx + 1 < length and tokens[idx + 1].lower() in {"-c", "-lc"}:
                     code_idx = idx + 2
                     if code_idx < length:
                         remainder = " ".join(tokens[code_idx:])

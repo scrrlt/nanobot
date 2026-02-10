@@ -3,6 +3,7 @@
 import asyncio
 import json
 import uuid
+import re
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,24 @@ def _redact_value(value: Any) -> str:
     return "<REDACTED>"
 
 
+def _sanitize_exception_text(msg: Any) -> str:
+    """Sanitize exception messages by redacting paths/keys and truncating."""
+    s = str(msg)
+    # Redact Windows paths
+    s = re.sub(r"[A-Za-z]:\\\\[^\\\s]+", "<REDACTED_PATH>", s)
+    # Redact common Unix paths (best-effort)
+    s = re.sub(r"/[^\s]+", "<REDACTED_PATH>", s)
+    # Redact common secret-like key/value pairs
+    s = re.sub(
+        r"(?i)((?:api[_-]?key|token|password|secret))\s*[:=]\s*[^\s]+",
+        lambda m: f"{m.group(1)}: <REDACTED>",
+        s,
+    )
+    if len(s) > 400:
+        s = s[:400] + "...[truncated]"
+    return s
+
+
 def _sanitize_arguments(tool_name: str, payload: Any) -> Any:
     tool_key = tool_name.lower()
     extra_sensitive = _TOOL_SENSITIVE_FIELDS.get(tool_key, frozenset())
@@ -65,6 +84,8 @@ def _sanitize_arguments(tool_name: str, payload: Any) -> Any:
             else:
                 sanitized[key] = _sanitize_arguments(tool_name, value)
         return sanitized
+    if isinstance(payload, tuple):
+        return tuple(_sanitize_arguments(tool_name, item) for item in payload)
     if isinstance(payload, list):
         return [_sanitize_arguments(tool_name, item) for item in payload]
     return payload
@@ -233,8 +254,9 @@ class SubagentManager:
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
 
         except Exception as e:
-            error_msg = f"Error: {str(e)}"
-            logger.error(f"Subagent [{task_id}] failed: {e}")
+            sanitized = _sanitize_exception_text(e)
+            error_msg = f"Error: {sanitized}"
+            logger.error(f"Subagent [{task_id}] failed: {sanitized}")
             await self._announce_result(task_id, label, task, error_msg, origin, "error")
 
     async def _announce_result(

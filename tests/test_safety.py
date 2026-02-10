@@ -18,12 +18,11 @@ class TestSafety(unittest.TestCase):
         self.assertIsNotNone(self.detector.check("ls", {"path": "."}))
 
     def test_state_breaking_resets_history(self):
-        self.detector.check("ls", {"path": "."})
+        self.assertIsNone(self.detector.check("ls", {"path": "."}))
         self.assertIsNone(self.detector.check("touch", {"file": "a.txt"}))
         self.assertIsNone(self.detector.check("ls", {"path": "."}))
         self.assertIsNone(self.detector.check("ls", {"path": "."})) # Should not trigger yet
         self.assertIsNotNone(self.detector.check("ls", {"path": "."})) # Should trigger now
-
     def test_normalization(self):
         # This test is a bit tricky as it depends on the workspace root.
         # We'll check that the normalized output is consistent.

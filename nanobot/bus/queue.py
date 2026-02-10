@@ -47,9 +47,16 @@ class MessageBus:
         Returns ``None`` once shutdown has been requested.
         """
         item = await self.inbound.get()
-        if isinstance(item, _InboundShutdown):
-            return None
-        return item
+        try:
+            if isinstance(item, _InboundShutdown):
+                return None
+            return item
+        finally:
+            # Always pair get() with task_done() so inbound.join() does not hang
+            try:
+                self.inbound.task_done()
+            except Exception:
+                pass
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
@@ -64,54 +71,67 @@ class MessageBus:
         Returns ``None`` once shutdown has been requested.
         """
         item = await self.outbound.get()
-        if isinstance(item, _OutboundShutdown):
-            return None
-        return item
+        try:
+            if isinstance(item, _OutboundShutdown):
+                return None
+            return item
+        finally:
+            # Always pair get() with task_done() so outbound.join() does not hang
+            try:
+                self.outbound.task_done()
+            except Exception:
+                pass
 
     def subscribe_outbound(
         self,
         channel: str,
         callback: Callable[[OutboundMessage], Awaitable[None]],
     ) -> None:
-        """Subscribe to outbound messages for a specific channel."""
+        """Subscribe to outbound messages for a specific channel.
+
+        Subscribers are invoked by the channel dispatcher when an outbound
+        message is consumed; this avoids multiple concurrent consumers of the
+        same outbound queue.
+        """
         if channel not in self._outbound_subscribers:
             self._outbound_subscribers[channel] = []
         self._outbound_subscribers[channel].append(callback)
 
-    async def dispatch_outbound(self) -> None:
-        """Dispatch outbound messages to subscribed channels."""
-        while True:
-            item = await self.outbound.get()
-            is_shutdown = isinstance(item, _OutboundShutdown)
+    async def notify_subscribers(self, msg: OutboundMessage) -> None:
+        """Invoke callbacks for subscribed outbound consumers."""
+        subscribers = self._outbound_subscribers.get(msg.channel, [])
+        dead_lettered = False
+        for callback in subscribers:
             try:
-                if not is_shutdown:
-                    subscribers = self._outbound_subscribers.get(item.channel, [])
-                    dead_lettered = False
-                    for callback in subscribers:
-                        try:
-                            await callback(item)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.error(
-                                "Error dispatching to %s: %s",
-                                item.channel,
-                                exc,
-                            )
-                            if not dead_lettered:
-                                await self._dead_letters.put(item)
-                                dead_lettered = True
-            finally:
-                self.outbound.task_done()
-            if is_shutdown:
-                break
+                await callback(msg)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error dispatching to %s: %s", msg.channel, exc)
+                if not dead_lettered:
+                    await self._dead_letters.put(msg)
+                    dead_lettered = True
+
+    async def dispatch_outbound(self) -> None:
+        """Deprecated: use ChannelManager to consume outbound messages and notify subscribers.
+
+        Historically this function consumed the outbound queue directly and
+        dispatched to subscribers. ChannelManager now acts as the single
+        consumer and will call notify_subscribers() after sending to the
+        destination channel. Calling this function will raise to avoid dual consumers.
+        """
+        raise NotImplementedError(
+            "dispatch_outbound is deprecated; ChannelManager handles outbound dispatch"
+        )
 
     def stop(self) -> None:
         """Signal the dispatcher and consumers to shut down."""
+        # Flip flags first to avoid a race window where multiple callers enqueue
+        # duplicate shutdown sentinels concurrently.
         if not self._inbound_shutdown_requested:
-            self.inbound.put_nowait(_InboundShutdown())
             self._inbound_shutdown_requested = True
+            self.inbound.put_nowait(_InboundShutdown())
         if not self._outbound_shutdown_requested:
-            self.outbound.put_nowait(_OutboundShutdown())
             self._outbound_shutdown_requested = True
+            self.outbound.put_nowait(_OutboundShutdown())
 
     @property
     def inbound_size(self) -> int:

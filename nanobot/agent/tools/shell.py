@@ -59,21 +59,38 @@ class ExecTool(Tool):
             "required": ["command"],
         }
 
-    def _is_soft_failure(self, command: str, stdout: str, stderr: str) -> bool:
-        """Scan for errors, but whitelist 'read' commands from stdout scanning."""
-        fatal = ["permission denied", "not found", "fatal error", "syntax error"]
-        if any(p in stderr.lower() for p in fatal):
-            return True
+    def _is_soft_failure(self, command: str, stdout: str, stderr: str, exit_code: int) -> bool:
+        """Scan for errors with refined rules, considering exit code and whitelisted readers.
 
-        # Don't fail if we are just reading a log file containing 'error'
-        readers = ["cat", "grep", "head", "tail", "less", "awk"]
+        - Always scan stderr for fatal patterns.
+        - Only inspect stdout for fatal patterns when the exit_code indicates failure.
+        - Commands known as "readers" (e.g., cat, ls) are exempt from stdout scanning.
+        """
+        # More specific fatal patterns (regex) to reduce false positives
+        fatal_patterns = [
+            r"\bpermission denied\b",
+            r"\bnot found\b",
+            r"^(?:error|failed|fatal)[:\s]",
+            r"\bsyntax error\b",
+        ]
+
+        # Check stderr first (case-insensitive, multiline)
+        for p in fatal_patterns:
+            if re.search(p, stderr or "", flags=re.I | re.M):
+                return True
+
+        # If process succeeded, don't treat stdout contents as a soft failure
+        if exit_code == 0:
+            return False
+
+        # Don't fail if we are just running a reader command that may legitimately
+        # output the word 'error' or similar as content
+        readers = ["cat", "grep", "head", "tail", "less", "awk", "find", "echo", "ls", "locate"]
         try:
-            # Parse command robustly to handle absolute paths and env vars
             tokens = shlex.split(command.strip())
             if not tokens:
-                return any(p in stdout.lower() for p in fatal)
+                return any(re.search(p, stdout or "", flags=re.I | re.M) for p in fatal_patterns)
 
-            # Skip environment variable assignments
             executable_token = None
             for token in tokens:
                 if "=" not in token:  # Not an env var assignment
@@ -81,23 +98,19 @@ class ExecTool(Tool):
                     break
 
             if executable_token:
-                # Extract basename for comparison
                 executable_name = os.path.basename(executable_token).lower()
                 if executable_name in readers:
                     return False
-        except (
-            ValueError
-        ):  # Fallback for malformed commands that shlex.split cannot parse
-            # Use simple whitespace splitting as a best-effort heuristic.
-            # This may misidentify the executable for complex shell constructs,
-            # so in ambiguous cases we conservatively treat the command as non-reader
-            # and still scan stdout for fatal patterns below.
+        except ValueError:
             parts = command.strip().split()
             if parts and os.path.basename(parts[0]).lower() in readers:
                 return False
 
-        return any(p in stdout.lower() for p in fatal)
-
+        # Finally, check stdout for fatal patterns (since exit_code != 0)
+        for p in fatal_patterns:
+            if re.search(p, stdout or "", flags=re.I | re.M):
+                return True
+        return False
     async def execute(self, **kwargs: Any) -> str:
         command = kwargs.get("command")
         working_dir = kwargs.get("working_dir")
@@ -159,7 +172,7 @@ class ExecTool(Tool):
             stderr_str = stderr.decode("utf-8", errors="replace") if stderr else ""
 
             is_hard_fail = process.returncode != 0
-            is_soft_fail = self._is_soft_failure(command, stdout_str, stderr_str)
+            is_soft_fail = self._is_soft_failure(command, stdout_str, stderr_str, process.returncode)
             is_quiet = not stdout_str.strip() and not stderr_str.strip()
 
             if is_hard_fail or is_soft_fail:

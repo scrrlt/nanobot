@@ -25,6 +25,9 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
         self._cached_base_prompt: str | None = None
+        # Cached session context appended to system messages (channel/chat_id)
+        # so update_system_suffix can preserve routing information.
+        self._cached_session_context: str | None = None
 
     def build_system_prompt(self) -> str:
         """
@@ -143,12 +146,18 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         """
         base_prompt = self.build_system_prompt()
         self._cached_base_prompt = base_prompt
+        # Cache session context when present so update_system_suffix can reuse it.
+        if channel and chat_id:
+            self._cached_session_context = f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
+        else:
+            self._cached_session_context = None
+
         prompt = base_prompt
         if system_suffix:
             prompt += f"\n\n{system_suffix}"  # Append Plan
 
-        if channel and chat_id:
-            prompt += f"\n\n## Current Session\nChannel: {channel}\nChat ID: {chat_id}"
+        if self._cached_session_context:
+            prompt += self._cached_session_context
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": prompt}]
 
@@ -261,6 +270,10 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         prompt = base_prompt
         if system_suffix:
             prompt = f"{base_prompt}\n\n{system_suffix}"
+
+        # Preserve previously cached session context (channel & chat_id) if any.
+        if getattr(self, "_cached_session_context", None):
+            prompt = f"{prompt}{self._cached_session_context}"
 
         # Update the first message (system message)
         messages[0]["content"] = prompt

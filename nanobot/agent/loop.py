@@ -113,6 +113,8 @@ class AgentLoop:
         )
 
         self._running = False
+        # Tracks invalid 'force' attempts per session for basic auditing
+        self._force_attempts: dict[str, int] = {}
         self._register_default_tools()
 
     @staticmethod
@@ -366,9 +368,38 @@ class AgentLoop:
                         )
                         continue
 
-                    # --- SAFETY INTERCEPTOR ---
-                    is_forced = tool.arguments.get("force", False)
+                    # --- SAFETY INTERCEPTOR & FORCE HANDLING ---
+                    is_forced = bool(tool.arguments.get("force", False))
+                    reason = tool.arguments.get("reason")
                     safety_err = safety.check(tool.name, tool.arguments)
+
+                    # Validate 'force' usage: require non-empty 'reason' (len>=10)
+                    if is_forced:
+                        if not isinstance(reason, str) or len(reason.strip()) < 10:
+                            count = self._force_attempts.get(msg.session_key, 0) + 1
+                            self._force_attempts[msg.session_key] = count
+                            logger.warning(
+                                "Force attempted without sufficient reason (session=%s tool=%s attempt=%d)",
+                                msg.session_key,
+                                tool.name,
+                                count,
+                            )
+                            result_text = (
+                                "Error: 'force' requires a non-empty 'reason' explanation "
+                                "(min 10 characters). Request blocked."
+                            )
+                            messages = self.context.add_tool_result(
+                                messages, tool.id, tool.name, result_text
+                            )
+                            continue
+                        # Log approved force usage (truncate reason for logs)
+                        safe_reason = " ".join(reason.splitlines())[:200]
+                        logger.info(
+                            "Force used with reason in session %s tool %s: %s",
+                            msg.session_key,
+                            tool.name,
+                            safe_reason,
+                        )
 
                     if safety_err and not is_forced:
                         # BLOCK ACTION
@@ -377,14 +408,24 @@ class AgentLoop:
                             "ESCAPE HATCH: Retry with 'force': true and a 'reason' "
                             "if you are certain this is necessary."
                         )
-                    else:
-                        # ALLOW ACTION
-                        # Log tool execution
-                        args_str = json.dumps(tool.arguments, ensure_ascii=False)
-                        logger.info(f"Tool call: {tool.name}({args_str[:200]})")
-                        
+                        messages = self.context.add_tool_result(messages, tool.id, tool.name, result_text)
+                        continue
+
+                    # --- ACTION EXECUTION (exception-safe) ---
+                    args_str = json.dumps(tool.arguments, ensure_ascii=False)
+                    logger.info(f"Tool call: {tool.name}({args_str[:200]})")
+                    try:
                         execution = await self.tools.execute(tool.name, tool.arguments)
                         result_text = execution.message if hasattr(execution, 'message') else str(execution)
+                    except Exception as exc:
+                        sanitized = f"{type(exc).__name__}: {str(exc)[:200]}"
+                        logger.error(
+                            "Tool execution error for session %s tool %s: %s",
+                            msg.session_key,
+                            tool.name,
+                            sanitized,
+                        )
+                        result_text = f"{STATUS_FAILED} - Tool execution error: {type(exc).__name__}"
 
                     # --- REFLECTION TRIGGER ---
                     if result_text.startswith(STATUS_FAILED):
