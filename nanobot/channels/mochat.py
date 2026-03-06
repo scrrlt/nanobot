@@ -1466,7 +1466,7 @@ class StateManager:
         self._save_task: Optional[asyncio.Task[None]] = None
         self._save_lock = asyncio.Lock()
         self._is_saving = False  # Prevents race conditions in debounced saves
-        self._is_saving = False  # Prevents race conditions in debounced saves
+        self._last_save_content: str = ""  # Track content to avoid redundant saves
 
     async def __aenter__(self) -> Self:
         """Async context manager entry."""
@@ -1578,6 +1578,11 @@ class StateManager:
                 }
 
                 content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+                
+                # Skip save if content hasn't changed (optimization for high-frequency scenarios)
+                if not force and content == self._last_save_content:
+                    logger.debug("Skipping redundant state save - content unchanged")
+                    return
 
                 # Atomic write: write to temp file, then replace
                 temp_path = self.cursor_path.with_suffix(".tmp")
@@ -1597,6 +1602,8 @@ class StateManager:
                     await asyncio.to_thread(temp_path.unlink, missing_ok=True)
                     raise
 
+                # Update content cache after successful save
+                self._last_save_content = content
                 logger.debug("Saved {} session cursors", len(self.session_cursors))
 
             except (OSError, PermissionError) as e:
@@ -1690,13 +1697,16 @@ class TargetManager:
         # Safe eviction: skip locked targets to prevent race conditions
         while len(self._target_locks) > self._max_locks:
             # Find first unlocked target for eviction
+            evicted = False
             for check_key, check_lock in list(self._target_locks.items()):
                 if not check_lock.locked():
                     self._target_locks.pop(check_key, None)
                     logger.debug("Evicted stale target lock: {}", check_key)
+                    evicted = True
                     break
-            else:
-                # All locks are currently held - temporarily increase limit
+            
+            if not evicted:
+                # All locks are currently held - temporarily allow exceeding limit
                 logger.warning(
                     "All {} target locks are held, deferring eviction", 
                     len(self._target_locks)
@@ -2316,11 +2326,18 @@ class MochatChannel(BaseChannel):
             logger.exception("Error starting fallback workers: {}", e)
 
     async def _refresh_loop(self) -> None:
-        """Background loop for target refresh and health monitoring."""
-        interval = max(1.0, self.config.refresh_interval_ms / 1000.0)
-
+        """Background loop for target refresh and health monitoring with jitter."""
+        base_interval = max(1.0, self.config.refresh_interval_ms / 1000.0)
+        
+        # Add ±10% jitter to prevent thundering herd issues
+        jitter_factor = 0.1
+        
         while self._running:
             try:
+                # Calculate jittered interval: base_interval ± 10%
+                jitter = random.uniform(-jitter_factor, jitter_factor)
+                interval = base_interval * (1.0 + jitter)
+                
                 await asyncio.sleep(interval)
 
                 if not self._running:
@@ -2474,8 +2491,9 @@ class MochatChannel(BaseChannel):
                     await asyncio.sleep(max(0.1, self.config.retry_delay_ms / 1000.0))
 
     async def _panel_fallback_worker(self, panel_id: str) -> None:
-        """HTTP polling worker for a specific panel with cursor tracking."""
-        sleep_interval = max(1.0, self.config.refresh_interval_ms / 1000.0)
+        """HTTP polling worker for a specific panel with cursor tracking and jitter."""
+        base_interval = max(1.0, self.config.refresh_interval_ms / 1000.0)
+        jitter_factor = 0.1  # ±10% jitter
         task = asyncio.current_task()
 
         while self._running and self._fallback_mode and not self._draining_fallback:
@@ -2548,8 +2566,10 @@ class MochatChannel(BaseChannel):
                 if task:
                     task._idle = True  # type: ignore
                     
-                # Respect draining state during sleep
+                # Respect draining state during sleep with jitter
                 if not self._draining_fallback:
+                    jitter = random.uniform(-jitter_factor, jitter_factor)
+                    sleep_interval = base_interval * (1.0 + jitter)
                     await asyncio.sleep(sleep_interval)
 
     async def _handle_processed_message(

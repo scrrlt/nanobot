@@ -535,15 +535,18 @@ def agent(
             console.print(f"\nReceived {sig_name}, goodbye!")
             sys.exit(0)
 
-        signal.signal(signal.SIGINT, _handle_signal)
-        signal.signal(signal.SIGTERM, _handle_signal)
-        # SIGHUP is not available on Windows
-        if hasattr(signal, 'SIGHUP'):
+        # Set up signal handlers with Windows compatibility
+        if os.name != 'nt':  # Unix-like systems
+            signal.signal(signal.SIGINT, _handle_signal)
+            signal.signal(signal.SIGTERM, _handle_signal) 
             signal.signal(signal.SIGHUP, _handle_signal)
-        # Ignore SIGPIPE to prevent silent process termination when writing to closed pipes
-        # SIGPIPE is not available on Windows
-        if hasattr(signal, 'SIGPIPE'):
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        else:  # Windows - limited signal support
+            signal.signal(signal.SIGINT, _handle_signal)
+            # SIGTERM is not well supported on Windows, use SIGBREAK instead
+            if hasattr(signal, 'SIGBREAK'):
+                signal.signal(signal.SIGBREAK, _handle_signal)
+            #logger.info("Windows detected: Limited signal handling (SIGINT/SIGBREAK only)")
 
         async def run_interactive():
             bus_task = asyncio.create_task(agent_loop.run())

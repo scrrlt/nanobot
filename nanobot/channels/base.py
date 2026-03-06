@@ -32,6 +32,20 @@ class BaseChannel(ABC):
         self.config = config
         self.bus = bus
         self._running = False
+        
+        # Backpressure configuration with defaults
+        backpressure_config = getattr(config, 'backpressure', None)
+        if backpressure_config:
+            self._max_retries = backpressure_config.max_retries
+            self._timeout = backpressure_config.timeout_seconds  
+            self._base_retry_delay = backpressure_config.base_retry_delay
+            self._max_retry_delay = min(backpressure_config.max_retry_delay, 30.0)
+        else:
+            # Fallback defaults for backward compatibility
+            self._max_retries = 3
+            self._timeout = 5.0
+            self._base_retry_delay = 1.0
+            self._max_retry_delay = 30.0
 
     @abstractmethod
     async def start(self) -> None:
@@ -102,13 +116,13 @@ class BaseChannel(ABC):
         chat_id: str,
         content: str,
         media: list[str] | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None, 
         session_key: str | None = None,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
+        max_retries: int | None = None,
+        retry_delay: float | None = None,
     ) -> None:
         """
-        Handle an incoming message from the chat platform with backpressure protection.
+        Handle an incoming message from the chat platform with configurable backpressure protection.
 
         This method checks permissions and forwards to the bus with retry logic
         to handle queue backpressure during high-volume scenarios.
@@ -120,8 +134,8 @@ class BaseChannel(ABC):
             media: Optional list of media URLs.
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
-            max_retries: Maximum number of retry attempts for queue full scenarios.
-            retry_delay: Base delay in seconds between retry attempts (with exponential backoff).
+            max_retries: Override max retry attempts (uses config default if None).
+            retry_delay: Override base retry delay (uses config default if None).
         """
         if not self.is_allowed(sender_id):
             logger.warning(
@@ -141,29 +155,33 @@ class BaseChannel(ABC):
             session_key_override=session_key,
         )
 
+        # Use configured values or method overrides
+        retries = max_retries if max_retries is not None else self._max_retries
+        base_delay = retry_delay if retry_delay is not None else self._base_retry_delay
+
         # Attempt to publish with retry logic for backpressure
-        for attempt in range(max_retries + 1):
+        for attempt in range(retries + 1):
             try:
-                # Use timeout to avoid blocking indefinitely
-                timeout = 5.0 if attempt < max_retries else None
+                # Use configured timeout to avoid blocking indefinitely
+                timeout = self._timeout if attempt < retries else None
                 published = await self.bus.publish_inbound(msg, timeout=timeout)
                 
                 if published:
                     return  # Success
                     
                 # Queue is full, implement retry with exponential backoff
-                if attempt < max_retries:
-                    delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                if attempt < retries:
+                    delay = min(base_delay * (2 ** attempt), self._max_retry_delay)
                     logger.info(
                         "Message bus backpressure detected, retrying in {:.1f}s (attempt {}/{})",
-                        delay, attempt + 1, max_retries
+                        delay, attempt + 1, retries
                     )
                     await asyncio.sleep(delay)
                 else:
                     # Final attempt failed
                     logger.error(
                         "Failed to publish message from {} after {} attempts due to persistent backpressure",
-                        sender_id, max_retries + 1
+                        sender_id, retries + 1
                     )
                     
             except Exception as e:

@@ -57,6 +57,7 @@ class AgentLoop:
         temperature: float = 0.1,
         max_tokens: int = 4096,
         memory_window: int = 100,
+        context_limit: int = 0,  # 0 = no limit, positive value = max messages before trimming
         reasoning_effort: str | None = None,
         brave_api_key: str | None = None,
         web_proxy: str | None = None,
@@ -77,6 +78,7 @@ class AgentLoop:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
+        self.context_limit = context_limit  # Context window management
         self.reasoning_effort = reasoning_effort
         self.brave_api_key = brave_api_key
         self.web_proxy = web_proxy
@@ -227,6 +229,16 @@ class AgentLoop:
 
         while iteration < self.max_iterations:
             iteration += 1
+            
+            # Implement sliding-window context trimming before API call
+            if hasattr(self, 'context_limit') and self.context_limit and self.context_limit > 0:
+                trimmed_messages = self._trim_context_window(messages, self.context_limit)
+                if len(trimmed_messages) < len(messages):
+                    logger.info(
+                        "Context window trimmed: {} -> {} messages (limit: {})",
+                        len(messages), len(trimmed_messages), self.context_limit
+                    )
+                messages = trimmed_messages
 
             response = await self.provider.chat(
                 messages=messages,
@@ -301,6 +313,47 @@ class AgentLoop:
             )
 
         return final_content, tools_used, messages
+    
+    def _trim_context_window(self, messages: list[dict], context_limit: int) -> list[dict]:
+        """
+        Implement sliding-window trimming to keep messages within context limits.
+        
+        Preserves system message and recent conversation while removing older messages
+        to stay within the specified token/message limit.
+        
+        Args:
+            messages: Current message history
+            context_limit: Maximum number of messages to retain
+            
+        Returns:
+            Trimmed message list within context limit
+        """
+        if len(messages) <= context_limit:
+            return messages
+            
+        # Always preserve system message (typically first message)
+        system_messages = [msg for msg in messages if msg.get('role') == 'system']
+        non_system_messages = [msg for msg in messages if msg.get('role') != 'system']
+        
+        # Reserve space for system messages
+        available_space = context_limit - len(system_messages)
+        
+        if available_space <= 0:
+            # If system messages exceed limit, just return first system message
+            return system_messages[:1] if system_messages else messages[:context_limit]
+        
+        # Keep the most recent N non-system messages
+        recent_messages = non_system_messages[-available_space:] if available_space < len(non_system_messages) else non_system_messages
+        
+        # Reconstruct: system messages + recent conversation
+        trimmed = system_messages + recent_messages
+        
+        logger.debug(
+            "Context trimming: kept {} system + {} recent messages (total: {})",
+            len(system_messages), len(recent_messages), len(trimmed)
+        )
+        
+        return trimmed
 
     async def run(self) -> None:
         """Run the agent loop with signal handling for graceful shutdown."""
@@ -550,18 +603,40 @@ class AgentLoop:
         if cmd == "/new":
             lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
             self._consolidating.add(session.key)
+            
+            # Create atomic transaction for session clearing
+            session_backup = None
             try:
                 async with lock:
+                    # Create backup before modification for rollback capability
+                    session_backup = {
+                        'messages': session.messages[:],
+                        'last_consolidated': session.last_consolidated
+                    }
+                    
                     snapshot = session.messages[session.last_consolidated:]
                     if snapshot:
                         temp = Session(key=session.key)
                         temp.messages = list(snapshot)
+                        
+                        # Archive memory with rollback on failure
                         if not await self._consolidate_memory(temp, archive_all=True):
                             return OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
                             )
-            except Exception:
+                    
+                    # Atomic session state update - only clear if archival succeeded
+                    session.clear()
+                    self.sessions.save(session)
+                    self.sessions.invalidate(session.key)
+                    
+            except Exception as e:
+                # Rollback session state if backup exists
+                if session_backup:
+                    session.messages[:] = session_backup['messages']
+                    session.last_consolidated = session_backup['last_consolidated']
+                    
                 logger.exception("/new archival failed for {}", session.key)
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
@@ -570,9 +645,6 @@ class AgentLoop:
             finally:
                 self._consolidating.discard(session.key)
 
-            session.clear()
-            self.sessions.save(session)
-            self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.")
         if cmd == "/help":
