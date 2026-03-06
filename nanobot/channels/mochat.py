@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Self, Set
 from uuid import uuid4
 
 import httpx
@@ -43,6 +44,13 @@ try:
     MSGPACK_AVAILABLE = True
 except ImportError:
     MSGPACK_AVAILABLE = False
+
+# Type Aliases (mypy-compatible)
+JsonDict = Dict[str, Any]
+DispatchCallback = Callable[[str, str, str, Dict[str, Any]], Awaitable[None]]
+EventHandler = Callable[..., Awaitable[None]]
+TargetLockMap = Dict[str, asyncio.Lock]
+MessageEntryList = List[Any]
 
 # Configuration constants
 MAX_SEEN_MESSAGE_IDS = 2000
@@ -104,7 +112,7 @@ class EventPayload(Protocol):
     messageId: str
     author: str
     content: Any
-    meta: Dict[str, Any]
+    meta: dict[str, Any]
     groupId: str
     converseId: str
 
@@ -113,25 +121,25 @@ class SocketEvent(Protocol):
     """Protocol for socket events."""
 
     type: str
-    timestamp: Optional[str]
+    timestamp: str | None
     payload: EventPayload
-    seq: Optional[int]
+    seq: int | None
 
 
 class WatchPayload(Protocol):
     """Protocol for watch payloads."""
 
     sessionId: str
-    cursor: Optional[int]
-    events: List[SocketEvent]
+    cursor: int | None
+    events: list[SocketEvent]
 
 
 class AuthorInfo(Protocol):
     """Protocol for author information."""
 
-    nickname: Optional[str]
-    email: Optional[str]
-    agentId: Optional[str]
+    nickname: str | None
+    email: str | None
+    agentId: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +151,7 @@ class MochatError(Exception):
     """Base exception for Mochat-related errors."""
 
     def __init__(
-        self, message: str, correlation_id: Optional[CorrelationId] = None
+        self, message: str, correlation_id: CorrelationId | None = None
     ) -> None:
         super().__init__(message)
         self.correlation_id = correlation_id or CorrelationId()
@@ -185,8 +193,8 @@ class APIError(MochatError):
     def __init__(
         self,
         message: str,
-        status_code: Optional[int] = None,
-        correlation_id: Optional[CorrelationId] = None,
+        status_code: int | None = None,
+        correlation_id: CorrelationId | None = None,
     ) -> None:
         super().__init__(message, correlation_id)
         self.status_code = status_code
@@ -219,8 +227,6 @@ class RetryConfig:
             self.base_delay_ms * (self.exponential_base**attempt), self.max_delay_ms
         )
         if self.jitter:
-            import random
-
             delay_ms *= 0.5 + random.random() * 0.5  # 50-100% of calculated delay
         return delay_ms / 1000.0
 
@@ -233,7 +239,7 @@ class MochatBufferedEntry:
     author: str
     sender_name: str = ""
     sender_username: str = ""
-    timestamp: Optional[int] = None
+    timestamp: int | None = None
     message_id: str = ""
     group_id: str = ""
     correlation_id: CorrelationId = field(default_factory=CorrelationId)
@@ -250,9 +256,9 @@ class MochatBufferedEntry:
 class DelayState:
     """Per-target delayed message state with proper lifecycle management."""
 
-    entries: List[MochatBufferedEntry] = field(default_factory=list)
+    entries: list[MochatBufferedEntry] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    timer: Optional[asyncio.Task[None]] = None
+    timer: asyncio.Task[None] | None = None
 
     async def cancel_timer(self) -> None:
         """Cancel any active timer."""
@@ -282,17 +288,17 @@ class MochatTarget:
 class ConnectionMetrics:
     """Connection health and performance metrics."""
 
-    connected_at: Optional[datetime] = None
-    last_heartbeat: Optional[datetime] = None
+    connected_at: datetime | None = None
+    last_heartbeat: datetime | None = None
     reconnect_count: int = 0
     message_count: int = 0
     error_count: int = 0
-    last_error: Optional[Exception] = None
+    last_error: Exception | None = None
 
     def record_connection(self) -> None:
         """Record a successful connection."""
-        self.connected_at = datetime.utcnow()
-        self.last_heartbeat = datetime.utcnow()
+        self.connected_at = datetime.now(UTC)
+        self.last_heartbeat = datetime.now(UTC)
 
     def record_heartbeat(self) -> None:
         """Record a heartbeat."""
@@ -320,8 +326,8 @@ class HealthStatus:
     is_healthy: bool
     connection_state: ConnectionState
     metrics: ConnectionMetrics
-    issues: List[str] = field(default_factory=list)
-    checked_at: datetime = field(default_factory=datetime.utcnow)
+    issues: list[str] = field(default_factory=list)
+    checked_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +379,7 @@ class CircuitBreaker:
 # ---------------------------------------------------------------------------
 
 
-def safe_dict(value: Any) -> Dict[str, Any]:
+def safe_dict(value: Any) -> dict[str, Any]:
     """Return value if it's a dict, else empty dict.
 
     Args:
@@ -411,8 +417,8 @@ def make_synthetic_event(
     converse_id: str,
     timestamp: Optional[Any] = None,
     *,
-    author_info: Optional[Any] = None,
-) -> Dict[str, Any]:
+    author_info: Any | None = None,
+) -> dict[str, Any]:
     """Build a synthetic 'message.add' event dict with validation.
 
     Args:
@@ -452,7 +458,7 @@ def make_synthetic_event(
 
     return {
         "type": EVENT_TYPE_MESSAGE_ADD,
-        "timestamp": timestamp or datetime.utcnow().isoformat(),
+        "timestamp": timestamp or datetime.now(UTC).isoformat(),
         "payload": payload,
     }
 
@@ -511,7 +517,7 @@ def resolve_mochat_target(raw: str) -> MochatTarget:
     )
 
 
-def extract_mention_ids(value: Any) -> List[str]:
+def extract_mention_ids(value: Any) -> list[str]:
     """Extract mention ids from heterogeneous mention payload.
 
     Args:
@@ -630,7 +636,7 @@ def build_buffered_body(entries: List[MochatBufferedEntry], is_group: bool) -> s
     return "\n".join(lines).strip()
 
 
-def parse_timestamp(value: Any) -> Optional[int]:
+def parse_timestamp(value: Any) -> int | None:
     """Parse event timestamp to epoch milliseconds.
 
     Args:
@@ -679,7 +685,7 @@ class ConnectionManager:
         self._on_disconnect: Optional[Callable[[], Awaitable[None]]] = None
         self._on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
 
-    async def __aenter__(self) -> "ConnectionManager":
+    async def __aenter__(self) -> Self:
         """Async context manager entry."""
         await self.start()
         return self
@@ -713,7 +719,7 @@ class ConnectionManager:
         }
 
     @property
-    def socket_client(self) -> Optional[Any]:
+    def socket_client(self) -> Any | None:
         """Get the socket client (if available)."""
         return self._socket_client
 
@@ -744,8 +750,6 @@ class ConnectionManager:
             if websocket_ok:
                 self._connection_state = ConnectionState.CONNECTED
                 self.metrics.record_connection()
-                # Setup socket handlers now that connection is established
-                await self._setup_socket_handlers()
             else:
                 logger.warning("WebSocket connection failed, using HTTP-only mode")
                 self._connection_state = (
@@ -968,7 +972,7 @@ class ConnectionManager:
 
         # Check connection age (detect stale connections)
         if self.metrics.connected_at:
-            connection_age = datetime.utcnow() - self.metrics.connected_at
+            connection_age = datetime.now(UTC) - self.metrics.connected_at
             if connection_age.total_seconds() > DAY_SECONDS:  # 24 hours
                 issues.append("Connection is stale (>24h)")
 
@@ -1025,9 +1029,9 @@ class ConnectionManager:
         self,
         method: str,
         path: str,
-        data: Optional[Dict[str, Any]] = None,
-        correlation_id: Optional[CorrelationId] = None,
-    ) -> Dict[str, Any]:
+        data: dict[str, Any] | None = None,
+        correlation_id: CorrelationId | None = None,
+    ) -> dict[str, Any]:
         """Make HTTP request with retry logic and error handling."""
         if not self._http_client:
             raise MochatConnectionError("HTTP client not available")
@@ -1112,8 +1116,8 @@ class ConnectionManager:
     async def http_upload(
         self,
         endpoint: str,
-        files: Dict[str, Any],
-        correlation_id: Optional[CorrelationId] = None,
+        files: dict[str, Any],
+        correlation_id: CorrelationId | None = None,
     ) -> Any:
         """Upload files via HTTP with retry logic."""
         correlation_id = correlation_id or CorrelationId()
@@ -1228,7 +1232,7 @@ class MessageBuffer:
         self._delay_states: Dict[str, DelayState] = {}
         self._processing_locks: Dict[str, asyncio.Lock] = {}
 
-    async def __aenter__(self) -> "MessageBuffer":
+    async def __aenter__(self) -> Self:
         """Async context manager entry."""
         return self
 
@@ -1432,7 +1436,7 @@ class StateManager:
         self._save_task: Optional[asyncio.Task[None]] = None
         self._save_lock = asyncio.Lock()
 
-    async def __aenter__(self) -> "StateManager":
+    async def __aenter__(self) -> Self:
         """Async context manager entry."""
         await self.load()
         return self
@@ -1451,7 +1455,7 @@ class StateManager:
                     logger.debug("No existing cursor file found")
                     return
 
-                content = self.cursor_path.read_text("utf-8")
+                content = await asyncio.to_thread(self.cursor_path.read_text, "utf-8")
                 data = json.loads(content)
 
                 if not isinstance(data, dict):
@@ -1521,7 +1525,7 @@ class StateManager:
 
                 data = {
                     "schemaVersion": 1,
-                    "updatedAt": datetime.utcnow().isoformat(),
+                    "updatedAt": datetime.now(UTC).isoformat(),
                     "cursors": self.session_cursors.copy(),
                 }
 
@@ -1530,27 +1534,19 @@ class StateManager:
                 # Atomic write: write to temp file, then replace
                 temp_path = self.cursor_path.with_suffix(".tmp")
                 try:
-                    temp_path.write_text(content, "utf-8")
+                    await asyncio.to_thread(temp_path.write_text, content, "utf-8")
                     if os.name == "nt":
                         # Windows requires target removal before replace
-                        if self.cursor_path.exists():
-                            self.cursor_path.unlink()
-                    temp_path.replace(self.cursor_path)
+                        if await asyncio.to_thread(self.cursor_path.exists):
+                            await asyncio.to_thread(self.cursor_path.unlink)
+                    await asyncio.to_thread(temp_path.replace, self.cursor_path)
                 except (OSError, PermissionError):
                     # Clean up temp file on filesystem error
-                    if temp_path.exists():
-                        try:
-                            temp_path.unlink()
-                        except OSError:
-                            pass  # Best effort cleanup
+                    await asyncio.to_thread(temp_path.unlink, missing_ok=True)
                     raise
                 except Exception:
                     # Clean up temp file on any error
-                    if temp_path.exists():
-                        try:
-                            temp_path.unlink()
-                        except OSError:
-                            pass  # Best effort cleanup
+                    await asyncio.to_thread(temp_path.unlink, missing_ok=True)
                     raise
 
                 logger.debug("Saved {} session cursors", len(self.session_cursors))
@@ -1758,7 +1754,7 @@ class TargetManager:
         """Update panel cursor for efficient polling."""
         self.panel_cursors[panel_id] = timestamp
 
-    def get_panel_cursor(self, panel_id: str) -> Optional[str]:
+    def get_panel_cursor(self, panel_id: str) -> str | None:
         """Get panel cursor for since-based polling."""
         return self.panel_cursors.get(panel_id)
 
@@ -2317,18 +2313,23 @@ class MochatChannel(BaseChannel):
                 )
 
     async def _stop_fallback_workers(self) -> None:
-        """Stop all fallback polling workers."""
+        """Stop all fallback polling workers with guaranteed cleanup."""
         self._fallback_mode = False
 
         tasks = list(self._fallback_tasks.values())
-        for task in tasks:
-            if not task.done():
-                task.cancel()
+        
+        try:
+            # Cancel all tasks
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-        self._fallback_tasks.clear()
+            # Wait for cancellation to complete
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            # Ensure task references are cleared even if gather fails
+            self._fallback_tasks.clear()
 
     async def _session_fallback_worker(self, session_id: str) -> None:
         """HTTP polling worker for a specific session."""
@@ -2646,8 +2647,12 @@ class MochatChannel(BaseChannel):
         except Exception as e:
             logger.exception("Error in send method: {}", e)
 
-    async def _upload_media(self, media_path: Path) -> Optional[str]:
-        """Upload media file to Mochat and return media ID."""
+    async def _upload_media(self, media_path: Path) -> str | None:
+        """Upload media file to Mochat and return media ID.
+        
+        Uses streaming upload via file handle to prevent loading large files
+        entirely into memory, optimized for Python 3.12+.
+        """
         if not self._connection_manager:
             return None
 
@@ -2656,6 +2661,7 @@ class MochatChannel(BaseChannel):
             file_name = media_path.name
             
             # Open file for streaming upload - httpx supports file handles directly
+            # This triggers streaming mode in httpx, preventing memory bloat
             with open(media_path, 'rb') as file_handle:
                 # Prepare multipart form data with file handle for streaming
                 files = {"file": (file_name, file_handle, self._get_mime_type(media_path))}
@@ -2742,7 +2748,7 @@ class MochatChannel(BaseChannel):
         )
 
     @staticmethod
-    def _extract_group_id(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    def _extract_group_id(metadata: dict[str, Any] | None) -> str | None:
         """Extract group ID from message metadata."""
         if not isinstance(metadata, dict):
             return None
@@ -2756,17 +2762,22 @@ class MochatChannel(BaseChannel):
         self._running = False
 
         try:
-            # Stop background tasks
-            if self._refresh_task and not self._refresh_task.done():
-                self._refresh_task.cancel()
-                try:
-                    await self._refresh_task
-                except asyncio.CancelledError:
-                    pass
-                self._refresh_task = None
+            # Stop background tasks with guaranteed cleanup
+            try:
+                if self._refresh_task and not self._refresh_task.done():
+                    self._refresh_task.cancel()
+                    try:
+                        await self._refresh_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._refresh_task = None
 
-            # Stop fallback workers
-            await self._stop_fallback_workers()
+                # Stop fallback workers
+                await self._stop_fallback_workers()
+            finally:
+                # Ensure task references are cleared even if cancellation fails
+                if self._refresh_task:
+                    self._refresh_task = None
 
             # Cleanup components (order matters)
             if self._message_buffer:
@@ -2786,18 +2797,6 @@ class MochatChannel(BaseChannel):
             self._target_manager = None
 
             logger.info("Mochat channel stopped")
-        # - Follows Single Responsibility Principle
-
-        # 5. ADDITIONAL IMPROVEMENTS NEEDED:
-        # - Configuration validation with Pydantic models
-        # - Metrics collection interface abstraction
-        # - Dependency injection for testability
-        # - Observer pattern for event handling
-        # - Circuit breaker pattern for external API calls (partially implemented)
-        # - Rate limiting for outbound requests
-        # - Connection pooling optimization
-        # - Memory usage monitoring and caps
-
         except Exception as e:
             logger.exception("Error during channel shutdown: {}", e)
 

@@ -55,7 +55,7 @@ class TestArchitecturalFixes:
         # Create dependencies
         retry_config = RetryConfig(max_attempts=3, base_delay_ms=100)
         conn_manager = ConnectionManager(mock_config, retry_config)
-        state_manager = StateManager(mock_config, temp_workspace)
+        state_manager = StateManager(temp_workspace)
         
         target_manager = TargetManager(mock_config, conn_manager, state_manager)
         
@@ -89,7 +89,7 @@ class TestArchitecturalFixes:
         
         retry_config = RetryConfig(max_attempts=3, base_delay_ms=100)
         conn_manager = ConnectionManager(mock_config, retry_config)
-        state_manager = StateManager(mock_config, temp_workspace)
+        state_manager = StateManager(temp_workspace)
         target_manager = TargetManager(mock_config, conn_manager, state_manager)
         
         # Test cursor tracking
@@ -114,7 +114,7 @@ class TestArchitecturalFixes:
         """Test that StateManager uses atomic writes."""
         from nanobot.channels.mochat import StateManager
         
-        state_manager = StateManager(mock_config, temp_workspace)
+        state_manager = StateManager(temp_workspace)
         
         # Update some cursors
         state_manager.update_cursor("session1", 100)
@@ -131,7 +131,7 @@ class TestArchitecturalFixes:
         assert not temp_path.exists()
         
         # Verify content can be loaded
-        new_state_manager = StateManager(mock_config, temp_workspace)
+        new_state_manager = StateManager(temp_workspace)
         await new_state_manager.load()
         
         assert new_state_manager.get_cursor("session1") == 100
