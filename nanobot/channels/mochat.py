@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
 import random
 import time
@@ -45,12 +46,12 @@ try:
 except ImportError:
     MSGPACK_AVAILABLE = False
 
-# Type Aliases (mypy-compatible)
-JsonDict = Dict[str, Any]
-DispatchCallback = Callable[[str, str, str, Dict[str, Any]], Awaitable[None]]
-EventHandler = Callable[..., Awaitable[None]]
-TargetLockMap = Dict[str, asyncio.Lock]
-MessageEntryList = List[Any]
+# Python 3.12+ Type Aliases
+type JsonDict = dict[str, Any]
+type DispatchCallback = Callable[[str, str, str, dict[str, Any]], Awaitable[None]]
+type EventHandler = Callable[..., Awaitable[None]]
+type TargetLockMap = dict[str, asyncio.Lock]
+type MessageEntryList = list[Any]
 
 # Configuration constants
 MAX_SEEN_MESSAGE_IDS = 2000
@@ -220,6 +221,19 @@ class RetryConfig:
     max_delay_ms: int = MAX_RETRY_DELAY_MS
     exponential_base: float = 2.0
     jitter: bool = True
+
+    def is_exhausted(self, attempt: int) -> bool:
+        """Check if retry attempts are exhausted.
+        
+        Args:
+            attempt: Current attempt number (0-based)
+            
+        Returns:
+            True if no more attempts should be made
+        """
+        if self.max_attempts == 0:  # Unlimited retries
+            return False
+        return attempt >= self.max_attempts
 
     def calculate_delay(self, attempt: int) -> float:
         """Calculate delay for given attempt number (0-based)."""
@@ -795,7 +809,8 @@ class ConnectionManager:
         url = f"{self.config.base_url.strip().rstrip('/')}/api/health"
         correlation_id = CorrelationId()
 
-        for attempt in range(self.retry_config.max_attempts):
+        attempt = 0
+        while not self.retry_config.is_exhausted(attempt):
             try:
                 response = await self._http_client.get(
                     url,
@@ -809,7 +824,7 @@ class ConnectionManager:
                 if response.status_code == 401:
                     raise AuthenticationError("Invalid claw_token", correlation_id)
 
-                if attempt == self.retry_config.max_attempts - 1:
+                if self.retry_config.is_exhausted(attempt + 1):
                     raise APIError(
                         f"HTTP connectivity test failed: {response.status_code}",
                         response.status_code,
@@ -817,12 +832,14 @@ class ConnectionManager:
                     )
 
             except (httpx.RequestError, httpx.TimeoutException) as e:
-                if attempt == self.retry_config.max_attempts - 1:
+                if self.retry_config.is_exhausted(attempt + 1):
                     raise MochatConnectionError(
                         f"HTTP connectivity test failed: {e}", correlation_id
                     ) from e
 
                 await asyncio.sleep(self.retry_config.calculate_delay(attempt))
+            
+            attempt += 1
 
     async def _start_websocket_connection(self) -> bool:
         """Start WebSocket connection with retry logic."""
@@ -834,73 +851,74 @@ class ConnectionManager:
         if not self.config.socket_disable_msgpack and MSGPACK_AVAILABLE:
             serializer = "msgpack"
         elif not self.config.socket_disable_msgpack:
-            logger.warning("msgpack not available, using JSON serializer")
+            logger.warning(
+                "msgpack serialization requested but not available, falling back to default"
+            )
 
         correlation_id = CorrelationId()
+        
+        # Single connection attempt - let socketio handle reconnection
+        if not self.circuit_breaker.can_execute():
+            logger.warning(
+                "Circuit breaker open, skipping WebSocket attempt [{}]",
+                correlation_id,
+            )
+            return False
 
-        for attempt in range(self.retry_config.max_attempts):
-            if not self.circuit_breaker.can_execute():
-                logger.warning(
-                    "Circuit breaker open, skipping WebSocket attempt [{}]",
-                    correlation_id,
-                )
-                return False
+        try:
+            # Configure socketio client with proper unlimited retry handling
+            reconnection_attempts = (
+                None if self.config.max_retry_attempts == 0 
+                else self.config.max_retry_attempts
+            )
+            
+            client = socketio.AsyncClient(
+                reconnection=True,
+                reconnection_attempts=reconnection_attempts,
+                reconnection_delay=max(
+                    0.1, self.config.socket_reconnect_delay_ms / 1000.0
+                ),
+                reconnection_delay_max=max(
+                    0.1, self.config.socket_max_reconnect_delay_ms / 1000.0
+                ),
+                logger=False,
+                engineio_logger=False,
+                serializer=serializer,
+            )
 
-            try:
-                client = socketio.AsyncClient(
-                    reconnection=True,
-                    reconnection_attempts=self.config.max_retry_attempts or None,
-                    reconnection_delay=max(
-                        0.1, self.config.socket_reconnect_delay_ms / 1000.0
-                    ),
-                    reconnection_delay_max=max(
-                        0.1, self.config.socket_max_reconnect_delay_ms / 1000.0
-                    ),
-                    logger=False,
-                    engineio_logger=False,
-                    serializer=serializer,
-                )
+            # Set up direct event handlers
+            await self._setup_socket_handlers(client)
 
-                # Set up direct event handlers
-                await self._setup_socket_handlers(client)
+            socket_url = (
+                (self.config.socket_url or self.config.base_url).strip().rstrip("/")
+            )
+            socket_path = (
+                (self.config.socket_path or "/socket.io").strip().lstrip("/")
+            )
 
-                socket_url = (
-                    (self.config.socket_url or self.config.base_url).strip().rstrip("/")
-                )
-                socket_path = (
-                    (self.config.socket_path or "/socket.io").strip().lstrip("/")
-                )
+            await client.connect(
+                socket_url,
+                transports=["websocket"],
+                socketio_path=socket_path,
+                auth={"token": self.config.claw_token},
+                wait_timeout=max(
+                    1.0, self.config.socket_connect_timeout_ms / 1000.0
+                ),
+            )
 
-                await client.connect(
-                    socket_url,
-                    transports=["websocket"],
-                    socketio_path=socket_path,
-                    auth={"token": self.config.claw_token},
-                    wait_timeout=max(
-                        1.0, self.config.socket_connect_timeout_ms / 1000.0
-                    ),
-                )
+            self._socket_client = client
+            self.circuit_breaker.record_success()
+            logger.info("WebSocket connection established [{}]", correlation_id)
+            return True
 
-                self._socket_client = client
-                self.circuit_breaker.record_success()
-                logger.info("WebSocket connection established [{}]", correlation_id)
-                return True
-
-            except Exception as e:
-                self.circuit_breaker.record_failure()
-                logger.warning(
-                    "WebSocket connection attempt {} failed [{}]: {}",
-                    attempt + 1,
-                    correlation_id,
-                    e,
-                )
-
-                if attempt == self.retry_config.max_attempts - 1:
-                    return False
-
-                await asyncio.sleep(self.retry_config.calculate_delay(attempt))
-
-        return False
+        except Exception as e:
+            self.circuit_breaker.record_failure()
+            logger.warning(
+                "WebSocket connection failed [{}]: {}",
+                correlation_id,
+                e,
+            )
+            return False
 
     async def _setup_socket_handlers(self, client: Any) -> None:
         """Setup socket.io event handlers."""
@@ -1049,7 +1067,8 @@ class ConnectionManager:
             "X-Correlation-ID": str(correlation_id),
         }
 
-        for attempt in range(self.retry_config.max_attempts):
+        attempt = 0
+        while not self.retry_config.is_exhausted(attempt):
             try:
                 if method.upper() == "GET":
                     response = await self._http_client.get(url, headers=headers)
@@ -1083,7 +1102,7 @@ class ConnectionManager:
                         "Authentication failed - invalid token", correlation_id
                     )
 
-                if attempt == self.retry_config.max_attempts - 1:
+                if self.retry_config.is_exhausted(attempt + 1):
                     raise APIError(
                         f"HTTP {response.status_code}: {response.text[:200]}",
                         response.status_code,
@@ -1094,7 +1113,7 @@ class ConnectionManager:
                 # Record failure for network issues
                 self.circuit_breaker.record_failure()
                 
-                if attempt == self.retry_config.max_attempts - 1:
+                if self.retry_config.is_exhausted(attempt + 1):
                     raise MochatConnectionError(
                         f"HTTP request failed: {e}", correlation_id
                     ) from e
@@ -1107,9 +1126,12 @@ class ConnectionManager:
                 )
 
                 await asyncio.sleep(self.retry_config.calculate_delay(attempt))
+            
+            attempt += 1
 
+        # This should only be reached if max_attempts is not 0 (unlimited)
         raise RetryExhaustedError(
-            f"HTTP request failed after {self.retry_config.max_attempts} attempts",
+            f"HTTP request failed after {attempt} attempts",
             correlation_id,
         )
 
@@ -1133,7 +1155,8 @@ class ConnectionManager:
 
         url = f"{self.config.base_url.rstrip('/')}{endpoint}"
 
-        for attempt in range(self.retry_config.max_attempts):
+        attempt = 0
+        while not self.retry_config.is_exhausted(attempt):
             try:
                 logger.debug(
                     "HTTP upload attempt {} to {} [{}]",
@@ -1167,7 +1190,7 @@ class ConnectionManager:
                     )
 
             except (httpx.RequestError, httpx.TimeoutException) as e:
-                if attempt == self.retry_config.max_attempts - 1:
+                if self.retry_config.is_exhausted(attempt + 1):
                     self.circuit_breaker.record_failure()
                     raise MochatConnectionError(
                         f"HTTP upload failed: {e}", correlation_id
@@ -1182,11 +1205,13 @@ class ConnectionManager:
                     e,
                 )
                 await asyncio.sleep(delay / 1000)
+            
+            attempt += 1
 
-        # Should never reach here due to the raise in the loop
+        # Should only be reached if max_attempts is not 0 (unlimited)
         self.circuit_breaker.record_failure()
         raise RetryExhaustedError(
-            f"HTTP upload failed after {self.retry_config.max_attempts} attempts",
+            f"HTTP upload failed after {attempt} attempts",
             correlation_id,
         )
 
@@ -1432,9 +1457,11 @@ class StateManager:
         self.state_dir = state_dir
         self.cursor_path = state_dir / "session_cursors.json"
 
-        self.session_cursors: Dict[str, int] = {}
+        self.session_cursors: dict[str, int] = {}
         self._save_task: Optional[asyncio.Task[None]] = None
         self._save_lock = asyncio.Lock()
+        self._is_saving = False  # Prevents race conditions in debounced saves
+        self._is_saving = False  # Prevents race conditions in debounced saves
 
     async def __aenter__(self) -> Self:
         """Async context manager entry."""
@@ -1498,15 +1525,20 @@ class StateManager:
 
         self.session_cursors[session_id] = cursor
 
-        # True debounce: cancel existing task and reset timer
-        if self._save_task and not self._save_task.done():
-            self._save_task.cancel()
-        self._save_task = asyncio.create_task(self._save_debounced())
+        # Race-safe debounce: only schedule if no save is pending
+        if not self._is_saving:
+            if self._save_task and not self._save_task.done():
+                self._save_task.cancel()
+            self._save_task = asyncio.create_task(self._save_debounced())
 
     async def _save_debounced(self) -> None:
         """Save with debouncing to avoid excessive disk writes."""
-        await asyncio.sleep(CURSOR_SAVE_DEBOUNCE_S)
-        await self.save()
+        self._is_saving = True
+        try:
+            await asyncio.sleep(CURSOR_SAVE_DEBOUNCE_S)
+            await self.save()
+        finally:
+            self._is_saving = False
 
     async def save(self, force: bool = False) -> None:
         """Save state to disk using atomic writes."""
@@ -2681,19 +2713,9 @@ class MochatChannel(BaseChannel):
         return None
 
     def _get_mime_type(self, file_path: Path) -> str:
-        """Get MIME type based on file extension."""
-        suffix = file_path.suffix.lower()
-        mime_types = {
-            ".png": "image/png",
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".gif": "image/gif",
-            ".pdf": "application/pdf",
-            ".txt": "text/plain",
-            ".doc": "application/msword",
-            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        }
-        return mime_types.get(suffix, "application/octet-stream")
+        """Get MIME type using Python's mimetypes module."""
+        mime_type, _ = mimetypes.guess_type(file_path)
+        return mime_type or "application/octet-stream"
 
     async def _send_session_message(
         self,
