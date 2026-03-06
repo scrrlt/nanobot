@@ -7,7 +7,7 @@ import json
 import re
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from loguru import logger
 
@@ -282,7 +282,11 @@ class AgentLoop:
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t: asyncio.create_task(self._cleanup_task(t, msg.session_key)))
+                task.add_done_callback(
+                    lambda t, key=msg.session_key: asyncio.create_task(
+                        self._cleanup_task(t, key)
+                    )
+                )
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -299,8 +303,17 @@ class AgentLoop:
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
-    async def _cleanup_task(self, task: asyncio.Task, session_key: str) -> None:
-        """Thread-safe cleanup of completed tasks."""
+    async def _cleanup_task(self, task: asyncio.Task[None], session_key: str) -> None:
+        """Thread-safe cleanup of completed tasks.
+        
+        Args:
+            task: The completed asyncio task to clean up.
+            session_key: The session key associated with the task.
+        
+        Note:
+            This method ensures thread-safe removal of completed tasks
+            from the active tasks dictionary and cleans up empty lists.
+        """
         async with self._task_cleanup_lock:
             if session_key in self._active_tasks:
                 try:

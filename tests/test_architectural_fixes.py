@@ -81,4 +81,62 @@ class TestArchitecturalFixes:
         for i in range(max(0, len(lock_keys) - max_locks), len(lock_keys)):
             target_id = lock_keys[i]
             lock = target_manager.get_target_lock("session", target_id)
-            assert lock is not None\n    \n    async def test_panel_cursor_tracking(self, mock_config, temp_workspace):\n        \"\"\"Test that TargetManager tracks panel cursors for efficient polling.\"\"\"\n        from nanobot.channels.mochat import TargetManager, ConnectionManager, StateManager, RetryConfig\n        \n        retry_config = RetryConfig(max_attempts=3, base_delay_ms=100)\n        conn_manager = ConnectionManager(mock_config, retry_config)\n        state_manager = StateManager(mock_config, temp_workspace)\n        target_manager = TargetManager(mock_config, conn_manager, state_manager)\n        \n        # Test cursor tracking\n        panel_id = \"panel_test\"\n        timestamp = \"2023-01-01T12:00:00Z\"\n        \n        # Initially no cursor\n        assert target_manager.get_panel_cursor(panel_id) is None\n        \n        # Update cursor\n        target_manager.update_panel_cursor(panel_id, timestamp)\n        \n        # Verify cursor is tracked\n        assert target_manager.get_panel_cursor(panel_id) == timestamp\n        \n        # Update cursor again\n        new_timestamp = \"2023-01-01T12:30:00Z\"\n        target_manager.update_panel_cursor(panel_id, new_timestamp)\n        assert target_manager.get_panel_cursor(panel_id) == new_timestamp\n    \n    async def test_atomic_state_saves(self, mock_config, temp_workspace):\n        \"\"\"Test that StateManager uses atomic writes.\"\"\"\n        from nanobot.channels.mochat import StateManager\n        \n        state_manager = StateManager(mock_config, temp_workspace)\n        \n        # Update some cursors\n        state_manager.update_cursor(\"session1\", 100)\n        state_manager.update_cursor(\"session2\", 200)\n        \n        # Force save\n        await state_manager.save(force=True)\n        \n        # Verify file exists and has correct content\n        assert state_manager.cursor_path.exists()\n        \n        # Verify no .tmp file left behind\n        temp_path = state_manager.cursor_path.with_suffix('.tmp')\n        assert not temp_path.exists()\n        \n        # Verify content can be loaded\n        new_state_manager = StateManager(mock_config, temp_workspace)\n        await new_state_manager.load()\n        \n        assert new_state_manager.get_cursor(\"session1\") == 100\n        assert new_state_manager.get_cursor(\"session2\") == 200\n    \n    async def test_encapsulation_public_methods(self, mock_config, temp_workspace):\n        \"\"\"Test that public methods are available for external use.\"\"\"\n        from nanobot.channels.mochat import TargetManager, EventProcessor, ConnectionManager, StateManager, MessageBuffer, RetryConfig\n        \n        retry_config = RetryConfig(max_attempts=3, base_delay_ms=100)\n        conn_manager = ConnectionManager(mock_config, retry_config)\n        state_manager = StateManager(mock_config, temp_workspace)\n        target_manager = TargetManager(mock_config, conn_manager, state_manager)\n        message_buffer = MessageBuffer(mock_config)\n        \n        # Mock dispatch callback\n        async def mock_dispatch(sender_id, chat_id, content, metadata):\n            pass\n        \n        event_processor = EventProcessor(\n            mock_config, target_manager, message_buffer, state_manager, mock_dispatch\n        )\n        \n        # Test that public methods exist and are callable\n        assert hasattr(target_manager, 'refresh_sessions')\n        assert callable(target_manager.refresh_sessions)\n        \n        assert hasattr(event_processor, 'process_message_event')\n        assert callable(event_processor.process_message_event)\n        \n        # Test calling public methods doesn't raise errors\n        await target_manager.refresh_sessions(subscribe_new=False)\n        \n        # Test event processing with mock data\n        mock_event = {\n            \"type\": \"message.add\",\n            \"payload\": {\n                \"messageId\": \"msg_123\",\n                \"author\": \"user_456\",\n                \"content\": \"Test message\",\n                \"meta\": {},\n                \"converseId\": \"session_test\"\n            }\n        }\n        \n        from nanobot.channels.mochat import TargetKind\n        await event_processor.process_message_event(\n            \"session_test\", mock_event, TargetKind.SESSION\n        )\n    \n    async def test_media_upload_method_exists(self, mock_config):\n        \"\"\"Test that media upload functionality is available.\"\"\"\n        with patch('nanobot.channels.mochat.get_data_path', return_value=Path(\"/tmp\")):\n            from nanobot.channels.mochat import MochatChannel\n            \n            mock_bus = Mock()\n            channel = MochatChannel(mock_config, mock_bus)\n            \n            # Test that media upload method exists\n            assert hasattr(channel, '_upload_media')\n            assert callable(channel._upload_media)\n            \n            assert hasattr(channel, '_get_mime_type')\n            assert callable(channel._get_mime_type)\n            \n            # Test MIME type detection\n            test_cases = [\n                (Path(\"test.png\"), \"image/png\"),\n                (Path(\"test.jpg\"), \"image/jpeg\"),\n                (Path(\"test.pdf\"), \"application/pdf\"),\n                (Path(\"test.unknown\"), \"application/octet-stream\"),\n            ]\n            \n            for file_path, expected_mime in test_cases:\n                mime_type = channel._get_mime_type(file_path)\n                assert mime_type == expected_mime\n    \n    async def test_panel_fallback_worker_cursor_usage(self, mock_config):\n        \"\"\"Test that panel fallback worker uses cursor tracking.\"\"\"\n        with patch('nanobot.channels.mochat.get_data_path', return_value=Path(\"/tmp\")):\n            with patch('httpx.AsyncClient'):\n                from nanobot.channels.mochat import MochatChannel\n                \n                mock_bus = Mock()\n                channel = MochatChannel(mock_config, mock_bus)\n                await channel._initialize_components()\n                \n                # Mock connection manager\n                mock_conn_manager = Mock()\n                mock_responses = [\n                    {\"messages\": []},  # First call - no cursor\n                    {\"messages\": []}   # Second call - with cursor\n                ]\n                mock_conn_manager.http_request = AsyncMock(side_effect=mock_responses)\n                channel._connection_manager = mock_conn_manager\n                \n                # Set up other components\n                channel._target_manager = Mock()\n                channel._target_manager.get_panel_cursor = Mock(side_effect=[None, \"2023-01-01T12:00:00Z\"])\n                channel._target_manager.update_panel_cursor = Mock()\n                \n                channel._fallback_mode = True\n                channel._running = True\n                \n                # Start fallback worker briefly\n                config_backup = channel.config.refresh_interval_ms\n                channel.config.refresh_interval_ms = 10  # Very fast for testing\n                \n                worker_task = asyncio.create_task(\n                    channel._panel_fallback_worker(\"test_panel\")\n                )\n                \n                # Let it run briefly\n                await asyncio.sleep(0.05)\n                \n                # Stop worker\n                channel._running = False\n                worker_task.cancel()\n                \n                try:\n                    await worker_task\n                except asyncio.CancelledError:\n                    pass\n                \n                # Restore config\n                channel.config.refresh_interval_ms = config_backup\n                \n                # Verify HTTP requests were made\n                assert mock_conn_manager.http_request.called\n                \n                # Verify cursor methods were called\n                channel._target_manager.get_panel_cursor.assert_called_with(\"test_panel\")\n\n\nif __name__ == \"__main__\":\n    pytest.main([__file__, \"-v\"])
+            assert lock is not None
+    
+    async def test_panel_cursor_tracking(self, mock_config, temp_workspace):
+        """Test that TargetManager tracks panel cursors for efficient polling."""
+        from nanobot.channels.mochat import TargetManager, ConnectionManager, StateManager, RetryConfig
+        
+        retry_config = RetryConfig(max_attempts=3, base_delay_ms=100)
+        conn_manager = ConnectionManager(mock_config, retry_config)
+        state_manager = StateManager(mock_config, temp_workspace)
+        target_manager = TargetManager(mock_config, conn_manager, state_manager)
+        
+        # Test cursor tracking
+        panel_id = "panel_test"
+        timestamp = "2023-01-01T12:00:00Z"
+        
+        # Initially no cursor
+        assert target_manager.get_panel_cursor(panel_id) is None
+        
+        # Update cursor
+        target_manager.update_panel_cursor(panel_id, timestamp)
+        
+        # Verify cursor is tracked
+        assert target_manager.get_panel_cursor(panel_id) == timestamp
+        
+        # Update cursor again
+        new_timestamp = "2023-01-01T12:30:00Z"
+        target_manager.update_panel_cursor(panel_id, new_timestamp)
+        assert target_manager.get_panel_cursor(panel_id) == new_timestamp
+    
+    async def test_atomic_state_saves(self, mock_config, temp_workspace):
+        """Test that StateManager uses atomic writes."""
+        from nanobot.channels.mochat import StateManager
+        
+        state_manager = StateManager(mock_config, temp_workspace)
+        
+        # Update some cursors
+        state_manager.update_cursor("session1", 100)
+        state_manager.update_cursor("session2", 200)
+        
+        # Force save
+        await state_manager.save(force=True)
+        
+        # Verify file exists and has correct content
+        assert state_manager.cursor_path.exists()
+        
+        # Verify no .tmp file left behind
+        temp_path = state_manager.cursor_path.with_suffix('.tmp')
+        assert not temp_path.exists()
+        
+        # Verify content can be loaded
+        new_state_manager = StateManager(mock_config, temp_workspace)
+        await new_state_manager.load()
+        
+        assert new_state_manager.get_cursor("session1") == 100
+        assert new_state_manager.get_cursor("session2") == 200
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

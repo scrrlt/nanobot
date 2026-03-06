@@ -1,24 +1,48 @@
 #!/usr/bin/env python3
 """
 Edge case tests for critical bug fixes.
-Focused on the most impactful behavioral changes.
+
+This module provides comprehensive edge case testing for critical behavioral
+changes implemented to prevent system instability and data corruption.
+
+The tests focus on the most impactful behavioral changes:
+- Orphaned tool result handling in session management
+- Atomic file operations for data persistence
+- Lock retention for concurrency safety
+- State management edge cases
+
+Classes:
+    TestSessionEdgeCases: Edge cases in Session.get_history() behavior.
+    TestAtomicSaveEdgeCases: Edge cases in atomic save operations.
+    TestLockRetentionEdgeCases: Edge cases in lock management.
 """
 
-import pytest
 import asyncio
-import tempfile
+import gc
 import json
+import tempfile
 from pathlib import Path
 from unittest.mock import Mock
+
+import pytest
 
 from nanobot.session.manager import Session, SessionManager
 
 
 class TestSessionEdgeCases:
-    """Test edge cases in Session.get_history() that could break LLM APIs."""
+    """Test edge cases in Session.get_history() that could break LLM APIs.
+    
+    These tests validate the critical orphaned tool result handling
+    that prevents LLM API crashes due to malformed message sequences.
+    """
 
-    def test_orphaned_tool_results_return_empty(self):
-        """Test that orphaned tool results return empty list to prevent LLM crashes."""
+    def test_orphaned_tool_results_return_empty(self) -> None:
+        """Test that orphaned tool results return empty list to prevent LLM crashes.
+        
+        Validates:
+            Scenarios where tool calls exist without preceding user messages
+            return empty lists to prevent LLM API errors from malformed sequences.
+        """
         session = Session(key="test_orphaned")
         
         # Add tool chain without user message (the problematic scenario)
@@ -32,8 +56,13 @@ class TestSessionEdgeCases:
         history = session.get_history()
         assert history == [], "Orphaned tool results should return empty list"
 
-    def test_normal_conversation_with_tools_works(self):
-        """Test that normal user conversations with tools still work correctly."""
+    def test_normal_conversation_with_tools_works(self) -> None:
+        """Test that normal user conversations with tools still work correctly.
+        
+        Validates:
+            Standard conversation flows with user messages and tool interactions
+            continue to work as expected after orphaned handling changes.
+        """
         session = Session(key="test_normal")
         
         # Normal conversation flow
@@ -50,8 +79,13 @@ class TestSessionEdgeCases:
         assert "tool_calls" in history[1], "Tool calls should be preserved"
         assert "tool_call_id" in history[2], "Tool results should be preserved"
 
-    def test_mixed_scenario_finds_user_start(self):
-        """Test finding user message in mixed orphaned/normal scenario."""
+    def test_mixed_scenario_finds_user_start(self) -> None:
+        """Test finding user message in mixed orphaned/normal scenario.
+        
+        Validates:
+            Mixed scenarios with both orphaned tool results and normal
+            user interactions properly identify the user message start point.
+        """
         session = Session(key="test_mixed")
         
         # Some orphaned tool results from previous interaction
@@ -67,8 +101,13 @@ class TestSessionEdgeCases:
         assert history[0]["role"] == "user", "Should start from user message"
         assert history[0]["content"] == "New question", "Should get correct user message"
 
-    def test_session_clear_resets_metadata(self):
-        """Test that session.clear() properly resets metadata to prevent inheritance."""
+    def test_session_clear_resets_metadata(self) -> None:
+        """Test that session.clear() properly resets metadata to prevent inheritance.
+        
+        Validates:
+            Session clearing completely resets all state including metadata
+            to prevent cross-session state inheritance issues.
+        """
         session = Session(key="test_clear")
         
         # Set up session state
@@ -86,8 +125,13 @@ class TestSessionEdgeCases:
         assert session.metadata == {}, "Metadata should be cleared"
         assert session.created_at == original_created, "Created time preserved"
 
-    def test_max_messages_with_no_user_messages(self):
-        """Test max_messages parameter when no user messages exist."""
+    def test_max_messages_with_no_user_messages(self) -> None:
+        """Test max_messages parameter when no user messages exist.
+        
+        Validates:
+            Edge case handling when max_messages parameter is used
+            but no user messages exist in the session.
+        """
         session = Session(key="test_max")
         
         # Add many assistant/tool messages without user messages
@@ -100,10 +144,23 @@ class TestSessionEdgeCases:
 
 
 class TestAtomicSaveEdgeCases:
-    """Test atomic save behavior to ensure corruption protection."""
+    """Test atomic save behavior to ensure corruption protection.
+    
+    These tests validate that atomic file operations properly prevent
+    data corruption during concurrent access and system failures.
+    """
 
-    def test_atomic_save_leaves_no_temp_files(self):
-        """Test that atomic saves clean up properly even on success."""
+    def test_atomic_save_leaves_no_temp_files(self) -> None:
+        """Test that atomic saves clean up properly even on success.
+        
+        Validates:
+            Atomic save operations clean up temporary files completely
+            and leave no residual .tmp files in the filesystem.
+            
+        Also validates:
+            - Session files are properly created and readable
+            - Content integrity is maintained through save/load cycle
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = SessionManager(Path(temp_dir))
             session = Session(key="test_atomic")
@@ -128,10 +185,23 @@ class TestAtomicSaveEdgeCases:
 
 @pytest.mark.asyncio
 class TestLockRetentionEdgeCases:
-    """Test lock retention to ensure concurrency safety."""
+    """Test lock retention to ensure concurrency safety.
+    
+    These tests validate that locks are properly retained and managed
+    to prevent race conditions in concurrent environments.
+    """
 
-    async def test_locks_survive_garbage_collection(self):
-        """Test that locks are properly retained and not garbage collected."""
+    async def test_locks_survive_garbage_collection(self) -> None:
+        """Test that locks are properly retained and not garbage collected.
+        
+        Validates:
+            Lock management using regular dict instead of WeakValueDictionary
+            ensures locks survive garbage collection and remain accessible.
+            
+        Note:
+            This simulates the fix applied to AgentLoop lock management
+            where WeakValueDictionary was replaced with regular dict.
+        """
         # Simulate the fixed lock management
         locks: dict[str, asyncio.Lock] = {}
         
@@ -143,7 +213,6 @@ class TestLockRetentionEdgeCases:
         lock1 = get_lock(session_key)
         
         # Force potential garbage collection
-        import gc
         gc.collect()
         
         # Lock should still be the same object

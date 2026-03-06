@@ -1031,6 +1031,10 @@ class ConnectionManager:
         """Make HTTP request with retry logic and error handling."""
         if not self._http_client:
             raise MochatConnectionError("HTTP client not available")
+        
+        # Check circuit breaker to prevent API spam during outages
+        if not self.circuit_breaker.can_execute():
+            raise MochatConnectionError("Circuit breaker is open - API temporarily unavailable")
 
         correlation_id = correlation_id or CorrelationId()
         url = f"{self.config.base_url.strip().rstrip('/')}{path}"
@@ -1055,14 +1059,21 @@ class ConnectionManager:
                 if response.is_success:
                     try:
                         result = response.json()
+                        # Record success in circuit breaker
+                        self.circuit_breaker.record_success()
                         return self._process_api_response(result, correlation_id)
                     except json.JSONDecodeError as e:
+                        # Record failure for invalid JSON response
+                        self.circuit_breaker.record_failure()
                         raise APIError(
                             f"Invalid JSON response: {e}",
                             response.status_code,
                             correlation_id,
                         ) from e
 
+                # Record failure for non-success status codes
+                self.circuit_breaker.record_failure()
+                
                 if response.status_code == 401:
                     raise AuthenticationError(
                         "Authentication failed - invalid token", correlation_id
@@ -1076,6 +1087,9 @@ class ConnectionManager:
                     )
 
             except (httpx.RequestError, httpx.TimeoutException) as e:
+                # Record failure for network issues
+                self.circuit_breaker.record_failure()
+                
                 if attempt == self.retry_config.max_attempts - 1:
                     raise MochatConnectionError(
                         f"HTTP request failed: {e}", correlation_id
@@ -1480,9 +1494,10 @@ class StateManager:
 
         self.session_cursors[session_id] = cursor
 
-        # Schedule save (debounced)
-        if not self._save_task or self._save_task.done():
-            self._save_task = asyncio.create_task(self._save_debounced())
+        # True debounce: cancel existing task and reset timer
+        if self._save_task and not self._save_task.done():
+            self._save_task.cancel()
+        self._save_task = asyncio.create_task(self._save_debounced())
 
     async def _save_debounced(self) -> None:
         """Save with debouncing to avoid excessive disk writes."""
@@ -1737,6 +1752,7 @@ class TargetManager:
         success = True
         success &= await self._subscribe_sessions(sorted(self.session_set))
         success &= await self._subscribe_panels(sorted(self.panel_set))
+        return success
 
     def update_panel_cursor(self, panel_id: str, timestamp: str) -> None:
         """Update panel cursor for efficient polling."""
@@ -2636,17 +2652,18 @@ class MochatChannel(BaseChannel):
             return None
 
         try:
-            # Read file data
-            file_data = media_path.read_bytes()
+            # Use file handle for streaming upload to prevent OOM
             file_name = media_path.name
+            
+            # Open file for streaming upload - httpx supports file handles directly
+            with open(media_path, 'rb') as file_handle:
+                # Prepare multipart form data with file handle for streaming
+                files = {"file": (file_name, file_handle, self._get_mime_type(media_path))}
 
-            # Prepare multipart form data
-            files = {"file": (file_name, file_data, self._get_mime_type(media_path))}
-
-            # Upload via HTTP client
-            response = await self._connection_manager.http_upload(
-                "/api/claw/media/upload", files=files
-            )
+                # Upload via HTTP client with streaming
+                response = await self._connection_manager.http_upload(
+                    "/api/claw/media/upload", files=files
+                )
 
             if isinstance(response, dict) and response.get("mediaId"):
                 logger.debug("Uploaded media: {} -> {}", file_name, response["mediaId"])
@@ -2769,65 +2786,6 @@ class MochatChannel(BaseChannel):
             self._target_manager = None
 
             logger.info("Mochat channel stopped")
-
-        # ---------------------------------------------------------------------------
-        # CODE QUALITY IMPROVEMENTS IMPLEMENTED
-        # ---------------------------------------------------------------------------
-
-        # 1. CONSTANTS AND ENUMS ADDED:
-        # - SOCKET_SUBSCRIBE_SESSIONS, SOCKET_SUBSCRIBE_PANELS, SOCKET_NOTIFY_MESSAGE_ADD
-        # - EVENT_TYPE_MESSAGE_ADD, DAY_SECONDS, MAX_LOCKS_DEFAULT
-        # - Eliminated magic strings and numbers throughout the codebase
-
-        # 2. SPECIFIC EXCEPTION HANDLING IMPLEMENTED:
-        # - Added ValidationError, TimeoutError exception classes
-        # - Replaced broad "except Exception:" with specific handlers for:
-        #   * File operations: OSError, PermissionError, FileNotFoundError
-        #   * Network operations: httpx.HTTPError, ConnectionError, asyncio.TimeoutError
-        #   * Data operations: json.JSONDecodeError, UnicodeEncodeError
-        #   * Only re-raise Exception in critical paths to prevent silent failures
-
-        # 3. THREAD SAFETY FIXED:
-        # - StateManager.load() now acquires _save_lock to prevent race conditions
-        # - Atomic file operations with proper cleanup on errors
-        # - Enhanced save method with specific filesystem error handling
-
-        # 4. GOD OBJECT REFACTORING APPROACH (Demonstration):
-        # The 2,624-line MochatChannel class violates SRP. Recommended refactoring:
-        #
-        # class MochatSession:
-        #     """Handles session-specific operations and state"""
-        #     async def send_message(self, content: str, media_ids: List[str]) -> None
-        #     async def get_messages(self, cursor: int) -> List[Dict[str, Any]]
-        #
-        # class MochatPanel:
-        #     """Handles panel-specific operations and state"""
-        #     async def send_message(self, content: str) -> None
-        #     async def get_messages(self, cursor: str) -> List[Dict[str, Any]]
-        #
-        # class MochatMediaHandler:
-        #     """Handles all media upload/download operations"""
-        #     async def upload_media(self, file_path: Path) -> str
-        #     def get_mime_type(self, file_path: Path) -> str
-        #
-        # class MochatEventRouter:
-        #     """Routes and processes incoming events"""
-        #     async def route_event(self, event: Dict[str, Any]) -> None
-        #     async def process_message_event(self, event: Dict[str, Any]) -> None
-        #
-        # Then MochatChannel becomes a coordinator:
-        # class MochatChannel(BaseChannel):
-        #     def __init__(self, config, bus):
-        #         self.session_handler = MochatSession(config, connection_manager)
-        #         self.panel_handler = MochatPanel(config, connection_manager)
-        #         self.media_handler = MochatMediaHandler(config, connection_manager)
-        #         self.event_router = MochatEventRouter(config, message_bus)
-        #
-        # This approach:
-        # - Separates concerns by entity type (session, panel, media)
-        # - Makes testing easier (can test each handler independently)
-        # - Reduces cognitive load (each class ~200-400 lines)
-        # - Improves maintainability and reduces merge conflicts
         # - Follows Single Responsibility Principle
 
         # 5. ADDITIONAL IMPROVEMENTS NEEDED:
