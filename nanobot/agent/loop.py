@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -107,8 +106,9 @@ class AgentLoop:
         self._mcp_connecting = False
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
-        self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._consolidation_locks: dict[str, asyncio.Lock] = {}  # Strong refs to locks
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._task_cleanup_lock = asyncio.Lock()  # Prevents race conditions in task cleanup
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
 
@@ -282,7 +282,7 @@ class AgentLoop:
             else:
                 task = asyncio.create_task(self._dispatch(msg))
                 self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                task.add_done_callback(lambda t: asyncio.create_task(self._cleanup_task(t, msg.session_key)))
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
@@ -299,7 +299,18 @@ class AgentLoop:
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
-
+    async def _cleanup_task(self, task: asyncio.Task, session_key: str) -> None:
+        """Thread-safe cleanup of completed tasks."""
+        async with self._task_cleanup_lock:
+            if session_key in self._active_tasks:
+                try:
+                    self._active_tasks[session_key].remove(task)
+                    # Clean up empty lists
+                    if not self._active_tasks[session_key]:
+                        del self._active_tasks[session_key]
+                except ValueError:
+                    # Task was already removed, ignore
+                    pass
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
         async with self._processing_lock:

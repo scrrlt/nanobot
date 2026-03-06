@@ -1,7 +1,9 @@
 """Session management for conversation history."""
 
 import json
+import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -48,10 +50,17 @@ class Session:
         sliced = unconsolidated[-max_messages:]
 
         # Drop leading non-user messages to avoid orphaned tool_result blocks
+        user_start_idx = None
         for i, m in enumerate(sliced):
             if m.get("role") == "user":
-                sliced = sliced[i:]
+                user_start_idx = i
                 break
+        
+        # If no user messages found, return empty to prevent LLM API errors
+        if user_start_idx is None:
+            return []
+            
+        sliced = sliced[user_start_idx:]
 
         out: list[dict[str, Any]] = []
         for m in sliced:
@@ -67,6 +76,8 @@ class Session:
         self.messages = []
         self.last_consolidated = 0
         self.updated_at = datetime.now()
+        self.metadata = {}  # Clear metadata to prevent state inheritance
+        # Note: created_at is intentionally preserved as session creation time
 
 
 class SessionManager:
@@ -160,22 +171,47 @@ class SessionManager:
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """Save a session to disk using atomic writes to prevent corruption."""
         path = self._get_session_path(session.key)
-
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
-
+        temp_path = None
+        
+        try:
+            # Write to temporary file first for atomic operation
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", 
+                                           dir=path.parent, delete=False, 
+                                           suffix=".tmp") as f:
+                temp_path = Path(f.name)
+                
+                metadata_line = {
+                    "_type": "metadata",
+                    "key": session.key,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                    "last_consolidated": session.last_consolidated
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+            
+            # Atomically replace the original file
+            if os.name == 'nt':  # Windows
+                if path.exists():
+                    path.unlink()
+            temp_path.replace(path)
+            temp_path = None  # Successfully moved, don't delete
+            
+        except Exception:
+            # Clean up temp file on error
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass  # Best effort cleanup
+            raise
+        
         self._cache[session.key] = session
 
     def invalidate(self, key: str) -> None:
