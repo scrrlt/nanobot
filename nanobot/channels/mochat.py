@@ -54,13 +54,14 @@ type TargetLockMap = dict[str, asyncio.Lock]
 type MessageEntryList = list[Any]
 
 # Configuration constants
-MAX_SEEN_MESSAGE_IDS = 2000
+MAX_SEEN_MESSAGE_IDS = 10000  # Increased for high-volume scenarios
 CURSOR_SAVE_DEBOUNCE_S = 0.5
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY_MS = 1000
 MAX_RETRY_DELAY_MS = 30000
 CONNECTION_TIMEOUT_S = 30.0
 DEFAULT_HEALTH_CHECK_INTERVAL_S = 60.0
+FALLBACK_DRAIN_TIMEOUT_S = 5.0  # Maximum time to wait for fallback workers to drain
 
 # Socket.IO API constants
 SOCKET_SUBSCRIBE_SESSIONS = "com.claw.im.subscribeSessions"
@@ -316,7 +317,7 @@ class ConnectionMetrics:
 
     def record_heartbeat(self) -> None:
         """Record a heartbeat."""
-        self.last_heartbeat = datetime.utcnow()
+        self.last_heartbeat = datetime.now(UTC)
 
     def record_message(self) -> None:
         """Record a processed message."""
@@ -685,7 +686,10 @@ class ConnectionManager:
     ) -> None:
         self.config = config
         self.retry_config = retry_config or RetryConfig()
-        self.circuit_breaker = CircuitBreaker()
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            recovery_timeout=config.circuit_breaker_recovery_timeout
+        )
         self.metrics = ConnectionMetrics()
 
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -1288,8 +1292,9 @@ class MessageBuffer:
         seen_set.add(message_id)
         seen_queue.append(message_id)
 
-        # Maintain size limit
-        while len(seen_queue) > MAX_SEEN_MESSAGE_IDS:
+        # Maintain size limit (configurable for high-volume scenarios)
+        max_seen_ids = getattr(self.config, 'max_seen_message_ids', MAX_SEEN_MESSAGE_IDS)
+        while len(seen_queue) > max_seen_ids:
             old_id = seen_queue.popleft()
             seen_set.discard(old_id)
 
@@ -1469,16 +1474,27 @@ class StateManager:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Async context manager exit."""
+        """Async context manager exit with orphaned file cleanup."""
         await self.save(force=True)
+        
+        # Clean up any orphaned .tmp files
+        try:
+            if await asyncio.to_thread(self.state_dir.exists):
+                temp_files = await asyncio.to_thread(list, self.state_dir.glob("*.tmp"))
+                for temp_path in temp_files:
+                    if await asyncio.to_thread(temp_path.exists):
+                        await asyncio.to_thread(temp_path.unlink, missing_ok=True)
+                        logger.debug("Cleaned up orphaned temp file: {}", temp_path)
+        except Exception as e:
+            logger.warning("Failed to clean orphaned temp files: {}", e)
 
     async def load(self) -> None:
         """Load state from disk with thread-safe file reading."""
         async with self._save_lock:  # Acquire lock to prevent race conditions
             try:
-                self.state_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(self.state_dir.mkdir, parents=True, exist_ok=True)
 
-                if not self.cursor_path.exists():
+                if not await asyncio.to_thread(self.cursor_path.exists):
                     logger.debug("No existing cursor file found")
                     return
 
@@ -1553,7 +1569,7 @@ class StateManager:
                         pass
                     self._save_task = None
 
-                self.state_dir.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(self.state_dir.mkdir, parents=True, exist_ok=True)
 
                 data = {
                     "schemaVersion": 1,
@@ -1671,10 +1687,21 @@ class TargetManager:
         lock = asyncio.Lock()
         self._target_locks[key] = lock
 
-        # Evict oldest if over limit
+        # Safe eviction: skip locked targets to prevent race conditions
         while len(self._target_locks) > self._max_locks:
-            oldest_key, _ = self._target_locks.popitem(last=False)
-            logger.debug("Evicted stale target lock: {}", oldest_key)
+            # Find first unlocked target for eviction
+            for check_key, check_lock in list(self._target_locks.items()):
+                if not check_lock.locked():
+                    self._target_locks.pop(check_key, None)
+                    logger.debug("Evicted stale target lock: {}", check_key)
+                    break
+            else:
+                # All locks are currently held - temporarily increase limit
+                logger.warning(
+                    "All {} target locks are held, deferring eviction", 
+                    len(self._target_locks)
+                )
+                break
 
         return lock
 
@@ -2095,6 +2122,7 @@ class MochatChannel(BaseChannel):
 
         # State tracking
         self._fallback_mode = False
+        self._draining_fallback = False  # Indicates workers are draining before shutdown
         self._initialization_complete = False
 
         # Configuration validation
@@ -2345,8 +2373,26 @@ class MochatChannel(BaseChannel):
                 )
 
     async def _stop_fallback_workers(self) -> None:
-        """Stop all fallback polling workers with guaranteed cleanup."""
+        """Stop all fallback polling workers with proper drain state."""
+        if not self._fallback_mode:
+            return  # Already stopped
+            
+        # Enter draining state - workers finish current request but don't start new ones
+        self._draining_fallback = True
+        logger.debug("Entered fallback worker drain state")
+        
+        # Give active workers time to complete their current requests
+        try:
+            await asyncio.wait_for(
+                self._wait_for_workers_to_complete(),
+                timeout=FALLBACK_DRAIN_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Fallback workers did not drain within {}s, forcing shutdown", FALLBACK_DRAIN_TIMEOUT_S)
+        
+        # Now disable fallback mode and cancel any remaining tasks
         self._fallback_mode = False
+        self._draining_fallback = False
 
         tasks = list(self._fallback_tasks.values())
         
@@ -2362,14 +2408,38 @@ class MochatChannel(BaseChannel):
         finally:
             # Ensure task references are cleared even if gather fails
             self._fallback_tasks.clear()
+            logger.debug("Fallback workers stopped successfully")
+    
+    async def _wait_for_workers_to_complete(self) -> None:
+        """Wait for fallback workers to complete their current polling cycles."""
+        # Poll until all workers are inactive or sleeping between cycles
+        check_interval = 0.1  # Check every 100ms
+        
+        while self._draining_fallback and self._fallback_tasks:
+            # Check if any workers are actively processing
+            active_count = sum(
+                1 for task in self._fallback_tasks.values()
+                if not task.done() and not getattr(task, '_idle', False)
+            )
+            
+            if active_count == 0:
+                break  # All workers are idle
+                
+            await asyncio.sleep(check_interval)
 
     async def _session_fallback_worker(self, session_id: str) -> None:
         """HTTP polling worker for a specific session."""
-        while self._running and self._fallback_mode:
+        task = asyncio.current_task()
+        
+        while self._running and self._fallback_mode and not self._draining_fallback:
             try:
                 if not self._connection_manager or not self._state_manager:
                     break
 
+                # Mark as active
+                if task:
+                    task._idle = False  # type: ignore
+                
                 cursor = self._state_manager.get_cursor(session_id)
 
                 response = await self._connection_manager.http_request(
@@ -2383,7 +2453,7 @@ class MochatChannel(BaseChannel):
                     },
                 )
 
-                if self._event_processor:
+                if self._event_processor and not self._draining_fallback:
                     await self._event_processor.handle_watch_payload(
                         response, TargetKind.SESSION
                     )
@@ -2394,16 +2464,28 @@ class MochatChannel(BaseChannel):
                 logger.warning(
                     "Session fallback worker error for {}: {}", session_id, e
                 )
-                await asyncio.sleep(max(0.1, self.config.retry_delay_ms / 1000.0))
+            finally:
+                # Mark as idle before sleep
+                if task:
+                    task._idle = True  # type: ignore
+                    
+                # Respect draining state during sleep
+                if not self._draining_fallback:
+                    await asyncio.sleep(max(0.1, self.config.retry_delay_ms / 1000.0))
 
     async def _panel_fallback_worker(self, panel_id: str) -> None:
         """HTTP polling worker for a specific panel with cursor tracking."""
         sleep_interval = max(1.0, self.config.refresh_interval_ms / 1000.0)
+        task = asyncio.current_task()
 
-        while self._running and self._fallback_mode:
+        while self._running and self._fallback_mode and not self._draining_fallback:
             try:
                 if not self._connection_manager or not self._target_manager:
                     break
+
+                # Mark as active
+                if task:
+                    task._idle = False  # type: ignore
 
                 # Build request payload with cursor support
                 payload = {
@@ -2421,7 +2503,7 @@ class MochatChannel(BaseChannel):
                 )
 
                 messages = response.get("messages")
-                if isinstance(messages, list) and messages:
+                if isinstance(messages, list) and messages and not self._draining_fallback:
                     # Process messages in chronological order
                     latest_timestamp = None
 
@@ -2446,7 +2528,7 @@ class MochatChannel(BaseChannel):
                             author_info=message_data.get("authorInfo"),
                         )
 
-                        if self._event_processor:
+                        if self._event_processor and not self._draining_fallback:
                             await self._event_processor.process_message_event(
                                 panel_id, event, TargetKind.PANEL
                             )
@@ -2457,13 +2539,18 @@ class MochatChannel(BaseChannel):
                             panel_id, latest_timestamp
                         )
 
-                # Sleep to throttle polling
-                await asyncio.sleep(sleep_interval)
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning("Panel fallback worker error for {}: {}", panel_id, e)
+            finally:
+                # Mark as idle before sleep
+                if task:
+                    task._idle = True  # type: ignore
+                    
+                # Respect draining state during sleep
+                if not self._draining_fallback:
+                    await asyncio.sleep(sleep_interval)
 
     async def _handle_processed_message(
         self, sender_id: str, chat_id: str, content: str, metadata: Dict[str, Any]
@@ -2604,7 +2691,7 @@ class MochatChannel(BaseChannel):
                     if isinstance(media_item, str) and media_item.strip():
                         # Check if it's a file path that exists
                         media_path = Path(media_item.strip())
-                        if media_path.exists() and media_path.is_file():
+                        if await asyncio.to_thread(media_path.exists) and await asyncio.to_thread(media_path.is_file):
                             try:
                                 # Upload media file
                                 media_id = await self._upload_media(media_path)
@@ -2711,6 +2798,20 @@ class MochatChannel(BaseChannel):
             logger.warning("Failed to upload media {}: {}", media_path.name, e)
 
         return None
+
+    async def upload_media(self, media_path: Path) -> Optional[str]:
+        """
+        Upload media file and return Mochat media ID.
+        
+        Standard interface implementation for BaseChannel media uploads.
+        
+        Args:
+            media_path: Path to the media file to upload
+            
+        Returns:
+            Mochat media ID string or None if upload failed
+        """
+        return await self._upload_media(media_path)
 
     def _get_mime_type(self, file_path: Path) -> str:
         """Get MIME type using Python's mimetypes module."""

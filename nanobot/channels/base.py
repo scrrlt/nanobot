@@ -1,7 +1,9 @@
 """Base channel interface for chat platforms."""
 
+import asyncio
 from abc import ABC, abstractmethod
-from typing import Any
+from pathlib import Path
+from typing import Any, List, Optional
 
 from loguru import logger
 
@@ -57,6 +59,29 @@ class BaseChannel(ABC):
             msg: The message to send.
         """
         pass
+        
+    async def upload_media(self, media_path: Path) -> Optional[str]:
+        """
+        Upload media file and return platform-specific media ID or URL.
+        
+        This provides a standardized interface for media uploads across
+        all channel types (Telegram, Discord, Mochat, etc.).
+        
+        Args:
+            media_path: Path to the media file to upload
+            
+        Returns:
+            Platform-specific media identifier or None if upload failed
+            
+        Note:
+            Default implementation returns None (no media support).
+            Channels that support media should override this method.
+        """
+        logger.warning(
+            "Channel {} does not implement media upload support", 
+            self.name
+        )
+        return None
 
     def is_allowed(self, sender_id: str) -> bool:
         """Check if *sender_id* is permitted.  Empty list → deny all; ``"*"`` → allow all."""
@@ -79,11 +104,14 @@ class BaseChannel(ABC):
         media: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
     ) -> None:
         """
-        Handle an incoming message from the chat platform.
+        Handle an incoming message from the chat platform with backpressure protection.
 
-        This method checks permissions and forwards to the bus.
+        This method checks permissions and forwards to the bus with retry logic
+        to handle queue backpressure during high-volume scenarios.
 
         Args:
             sender_id: The sender's identifier.
@@ -92,6 +120,8 @@ class BaseChannel(ABC):
             media: Optional list of media URLs.
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
+            max_retries: Maximum number of retry attempts for queue full scenarios.
+            retry_delay: Base delay in seconds between retry attempts (with exponential backoff).
         """
         if not self.is_allowed(sender_id):
             logger.warning(
@@ -111,7 +141,34 @@ class BaseChannel(ABC):
             session_key_override=session_key,
         )
 
-        await self.bus.publish_inbound(msg)
+        # Attempt to publish with retry logic for backpressure
+        for attempt in range(max_retries + 1):
+            try:
+                # Use timeout to avoid blocking indefinitely
+                timeout = 5.0 if attempt < max_retries else None
+                published = await self.bus.publish_inbound(msg, timeout=timeout)
+                
+                if published:
+                    return  # Success
+                    
+                # Queue is full, implement retry with exponential backoff
+                if attempt < max_retries:
+                    delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                    logger.info(
+                        "Message bus backpressure detected, retrying in {:.1f}s (attempt {}/{})",
+                        delay, attempt + 1, max_retries
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    # Final attempt failed
+                    logger.error(
+                        "Failed to publish message from {} after {} attempts due to persistent backpressure",
+                        sender_id, max_retries + 1
+                    )
+                    
+            except Exception as e:
+                logger.exception("Error publishing message from {}: {}", sender_id, e)
+                break
 
     @property
     def is_running(self) -> bool:

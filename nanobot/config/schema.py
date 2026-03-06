@@ -161,6 +161,9 @@ class MochatConfig(Base):
     groups: dict[str, MochatGroupRule] = Field(default_factory=dict)
     reply_delay_mode: str = "non-mention"  # off | non-mention
     reply_delay_ms: int = 120000
+    max_seen_message_ids: int = 10000  # Deduplication cache size for high-volume scenarios
+    circuit_breaker_failure_threshold: int = 5  # Circuit breaker failure count before opening
+    circuit_breaker_recovery_timeout: float = 60.0  # Seconds before attempting recovery
 
 
 class SlackDMConfig(Base):

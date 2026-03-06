@@ -108,10 +108,10 @@ def correlation_id():
 # Test utility functions
 # ---------------------------------------------------------------------------
 
-class TestUtilityFunctions:
+class TestMochatUtilityFunctions:
     """Test pure utility functions."""
     
-    def test_safe_dict(self):
+    def test_safe_dict_converts_valid_dict_unchanged(self):
         """Test safe_dict function."""
         assert safe_dict({"key": "value"}) == {"key": "value"}
         assert safe_dict(None) == {}
@@ -119,7 +119,7 @@ class TestUtilityFunctions:
         assert safe_dict(123) == {}
         assert safe_dict([]) == {}
     
-    def test_str_field(self):
+    def test_str_field_extracts_string_values_with_fallbacks(self):
         """Test str_field function."""
         data = {"name": "test", "empty": "", "number": 123, "none": None}
         
@@ -131,7 +131,7 @@ class TestUtilityFunctions:
         assert str_field(data, "missing", "name") == "test"
         assert str_field(data, "missing", "empty", "name") == "test"
     
-    def test_normalize_mochat_content(self):
+    def test_normalize_mochat_content_handles_various_input_types(self):
         """Test content normalization."""
         assert normalize_mochat_content("hello") == "hello"
         assert normalize_mochat_content("  test  ") == "test"
@@ -139,7 +139,7 @@ class TestUtilityFunctions:
         assert normalize_mochat_content({"msg": "hello"}) == '{"msg": "hello"}'
         assert normalize_mochat_content(123) == "123"
     
-    def test_resolve_mochat_target(self):
+    def test_resolve_mochat_target_parses_session_and_panel_identifiers(self):
         """Test target resolution."""
         # Basic targets
         target = resolve_mochat_target("session_123")
@@ -169,7 +169,7 @@ class TestUtilityFunctions:
         with pytest.raises(ValueError):
             resolve_mochat_target("panel:")
     
-    def test_extract_mention_ids(self):
+    def test_extract_mention_ids_from_various_mention_formats(self):
         """Test mention ID extraction."""
         assert extract_mention_ids([]) == []
         assert extract_mention_ids("not a list") == []
@@ -189,7 +189,7 @@ class TestUtilityFunctions:
         result = extract_mention_ids(mentions)
         assert set(result) == {"user1", "user2", "user3", "user5"}
     
-    def test_resolve_was_mentioned(self):
+    def test_resolve_was_mentioned_detects_agent_mentions_correctly(self):
         """Test mention resolution."""
         agent_id = "agent_123"
         
@@ -220,7 +220,7 @@ class TestUtilityFunctions:
         assert resolve_was_mentioned(payload, None) is False
         assert resolve_was_mentioned(payload, "") is False
     
-    def test_build_buffered_body(self):
+    def test_build_buffered_body_formats_single_and_multi_author_messages(self):
         """Test buffered body building."""
         # Single entry
         entry = MochatBufferedEntry(raw_body="Hello", author="user1")
@@ -243,7 +243,7 @@ class TestUtilityFunctions:
         empty_entry = MochatBufferedEntry(raw_body="", author="user3")
         assert build_buffered_body([empty_entry], False) == ""
     
-    def test_parse_timestamp(self):
+    def test_parse_timestamp_converts_iso_strings_to_unix_time(self):
         """Test timestamp parsing."""
         # Valid ISO format
         iso_time = "2023-01-01T12:00:00Z"
@@ -262,7 +262,7 @@ class TestUtilityFunctions:
         assert parse_timestamp(None) is None
         assert parse_timestamp(123) is None
     
-    def test_make_synthetic_event(self):
+    def test_make_synthetic_event_creates_valid_message_event_structure(self):
         """Test synthetic event creation."""
         event = make_synthetic_event(
             message_id="msg_123",
@@ -300,10 +300,10 @@ class TestUtilityFunctions:
 # Test data classes and exceptions
 # ---------------------------------------------------------------------------
 
-class TestDataClasses:
+class TestMochatDataClasses:
     """Test data classes and exception types."""
     
-    def test_correlation_id(self):
+    def test_correlation_id_generates_unique_identifiers(self):
         """Test CorrelationId creation."""
         cid = CorrelationId()
         assert len(str(cid)) == 8
@@ -313,7 +313,7 @@ class TestDataClasses:
         cid2 = CorrelationId()
         assert str(cid) != str(cid2)
     
-    def test_retry_config(self):
+    def test_retry_config_calculates_exponential_backoff_delays(self):
         """Test RetryConfig delay calculation."""
         config = RetryConfig(base_delay_ms=1000, max_delay_ms=10000, jitter=False)
         
@@ -331,7 +331,7 @@ class TestDataClasses:
         assert len(set(delays)) > 1  # Should have variation
         assert all(1.0 <= d <= 2.0 for d in delays)  # Within expected range
     
-    def test_mochat_buffered_entry_validation(self):
+    def test_mochat_buffered_entry_validates_required_fields(self):
         """Test MochatBufferedEntry validation."""
         # Valid entry
         entry = MochatBufferedEntry(raw_body="Hello", author="user1")
@@ -348,7 +348,7 @@ class TestDataClasses:
         with pytest.raises(ValueError):
             MochatBufferedEntry(raw_body="Hello", author="  ")
     
-    def test_mochat_error_types(self):
+    def test_mochat_error_types_inherit_from_base_exception_correctly(self):
         """Test exception hierarchy."""
         cid = CorrelationId()
         
@@ -371,17 +371,17 @@ class TestDataClasses:
 # Test CircuitBreaker
 # ---------------------------------------------------------------------------
 
-class TestCircuitBreaker:
+class TestMochatCircuitBreaker:
     """Test circuit breaker functionality."""
     
-    def test_initial_state(self):
+    def test_circuit_breaker_starts_in_closed_state_allowing_execution(self):
         """Test circuit breaker initial state."""
         cb = CircuitBreaker(failure_threshold=3)
         assert cb.can_execute() is True
         assert cb.state == "closed"
         assert cb.failure_count == 0
     
-    def test_failure_accumulation(self):
+    def test_circuit_breaker_opens_after_failure_threshold_reached(self):
         """Test failure count accumulation."""
         cb = CircuitBreaker(failure_threshold=3)
         
@@ -402,7 +402,7 @@ class TestCircuitBreaker:
         assert cb.failure_count == 3
         assert cb.state == "open"
     
-    def test_success_reset(self):
+    def test_circuit_breaker_resets_failure_count_on_success(self):
         """Test circuit reset on success."""
         cb = CircuitBreaker(failure_threshold=3)
         
@@ -417,7 +417,7 @@ class TestCircuitBreaker:
         assert cb.can_execute() is True
     
     @pytest.mark.asyncio
-    async def test_recovery_timeout(self):
+    async def test_circuit_breaker_transitions_to_half_open_after_recovery_timeout(self):
         """Test circuit recovery after timeout."""
         cb = CircuitBreaker(failure_threshold=2, recovery_timeout=0.1)
         
@@ -443,7 +443,7 @@ class TestCircuitBreaker:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestConnectionManager:
+class TestMochatConnectionManager:
     """Test ConnectionManager functionality."""
     
     async def test_initialization(self, mock_config):
@@ -456,7 +456,7 @@ class TestConnectionManager:
         assert cm.connection_state == ConnectionState.DISCONNECTED
         assert not cm.is_connected
     
-    async def test_validation_errors(self):
+    async def test_connection_manager_rejects_invalid_configurations(self):
         """Test configuration validation."""
         config = Mock()
         config.claw_token = ""
@@ -467,7 +467,7 @@ class TestConnectionManager:
             await cm.start()
     
     @patch('httpx.AsyncClient')
-    async def test_http_connectivity_test(self, mock_client_class, mock_config):
+    async def test_connection_manager_performs_http_connectivity_check(self, mock_client_class, mock_config):
         """Test HTTP connectivity testing."""
         # Setup mock HTTP client
         mock_client = AsyncMock()
@@ -491,7 +491,7 @@ class TestConnectionManager:
         with pytest.raises(Exception):
             await cm._test_http_connectivity()
     
-    async def test_health_status(self, mock_config):
+    async def test_connection_manager_reports_health_status_correctly(self, mock_config):
         """Test health status reporting."""
         cm = ConnectionManager(mock_config)
         
@@ -501,7 +501,7 @@ class TestConnectionManager:
         assert "HTTP client not available" in health.issues
     
     @patch('httpx.AsyncClient')
-    async def test_http_request_retry_logic(self, mock_client_class, mock_config):
+    async def test_connection_manager_retries_failed_http_requests_with_backoff(self, mock_client_class, mock_config):
         """Test HTTP request retry mechanism."""
         mock_client = AsyncMock()
         mock_client_class.return_value = mock_client
@@ -528,10 +528,10 @@ class TestConnectionManager:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestStateManager:
+class TestMochatStateManager:
     """Test StateManager functionality."""
     
-    async def test_initialization(self, temp_state_dir):
+    async def test_state_manager_initializes_with_clean_directory(self, temp_state_dir):
         """Test StateManager initialization."""
         sm = StateManager(temp_state_dir)
         await sm.load()
@@ -539,7 +539,7 @@ class TestStateManager:
         assert len(sm.session_cursors) == 0
         assert sm.get_cursor("unknown") == 0
     
-    async def test_cursor_management(self, temp_state_dir):
+    async def test_state_manager_manages_session_cursors_correctly(self, temp_state_dir):
         """Test cursor update and retrieval."""
         sm = StateManager(temp_state_dir)
         await sm.load()
@@ -558,7 +558,7 @@ class TestStateManager:
         sm.update_cursor("session1", -10)  # Negative
         assert sm.get_cursor("session1") == 100  # Unchanged
     
-    async def test_persistence(self, temp_state_dir):
+    async def test_state_manager_persists_and_loads_state_atomically(self, temp_state_dir):
         """Test state persistence across instances."""
         # First instance
         sm1 = StateManager(temp_state_dir)
@@ -574,7 +574,7 @@ class TestStateManager:
         assert sm2.get_cursor("session1") == 100
         assert sm2.get_cursor("session2") == 200
     
-    async def test_corrupted_state_file(self, temp_state_dir):
+    async def test_state_manager_handles_corrupted_state_files_gracefully(self, temp_state_dir):
         """Test handling of corrupted state file."""
         # Create invalid JSON file
         cursor_file = temp_state_dir / "session_cursors.json"
@@ -591,10 +591,10 @@ class TestStateManager:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio 
-class TestMessageBuffer:
+class TestMochatMessageBuffer:
     """Test MessageBuffer functionality."""
     
-    async def test_deduplication(self, mock_config):
+    async def test_message_buffer_deduplicates_messages_by_id(self, mock_config):
         """Test message deduplication."""
         mb = MessageBuffer(mock_config)
         
@@ -610,7 +610,7 @@ class TestMessageBuffer:
         # Same message, different target should not be duplicate
         assert not mb.is_duplicate_message("session:2", "msg1")
     
-    async def test_message_processing_immediate(self, mock_config):
+    async def test_message_buffer_processes_high_priority_messages_immediately(self, mock_config):
         """Test immediate message processing."""
         mb = MessageBuffer(mock_config)
         
@@ -638,7 +638,7 @@ class TestMessageBuffer:
         assert dispatched_messages[0][2][0] == entry  # entries
         assert dispatched_messages[0][3] is True  # was_mentioned
     
-    async def test_delayed_processing(self, mock_config):
+    async def test_message_buffer_delays_processing_for_non_mention_messages(self, mock_config):
         """Test delayed message processing."""
         mock_config.reply_delay_ms = 100  # 100ms delay
         mb = MessageBuffer(mock_config)
@@ -670,7 +670,7 @@ class TestMessageBuffer:
         # Should be dispatched now
         assert len(dispatched_messages) == 1
     
-    async def test_mention_flushes_delay(self, mock_config):
+    async def test_message_buffer_flushes_delayed_messages_on_mention(self, mock_config):
         """Test that mentions flush delayed messages."""
         mock_config.reply_delay_ms = 1000  # Long delay
         mb = MessageBuffer(mock_config)
@@ -718,10 +718,10 @@ class TestMessageBuffer:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestTargetManager:
+class TestMochatTargetManager:
     """Test TargetManager functionality."""
     
-    async def test_initialization(self, mock_config):
+    async def test_target_manager_initializes_with_session_and_panel_discovery(self, mock_config):
         """Test TargetManager initialization."""
         mock_cm = Mock()
         tm = TargetManager(mock_config, mock_cm)
@@ -736,7 +736,7 @@ class TestTargetManager:
         assert "session_1" in tm.cold_sessions
         assert "session_2" in tm.cold_sessions
     
-    async def test_cold_session_management(self, mock_config):
+    async def test_target_manager_tracks_cold_sessions_requiring_history_backfill(self, mock_config):
         """Test cold session tracking."""
         mock_cm = Mock()
         tm = TargetManager(mock_config, mock_cm)
@@ -747,7 +747,7 @@ class TestTargetManager:
         assert not tm.is_cold_session("session_1")
         assert tm.is_cold_session("session_2")  # Still cold
     
-    async def test_target_locks(self, mock_config):
+    async def test_target_manager_provides_thread_safe_locks_per_target(self, mock_config):
         """Test target locking mechanism."""
         mock_cm = Mock()
         tm = TargetManager(mock_config, mock_cm)
@@ -768,10 +768,10 @@ class TestTargetManager:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestEventProcessor:
+class TestMochatEventProcessor:
     """Test EventProcessor functionality."""
     
-    async def test_watch_payload_processing(self, mock_config):
+    async def test_event_processor_handles_watch_payload_message_events(self, mock_config):
         """Test watch payload processing."""
         from unittest.mock import AsyncMock
         
@@ -824,7 +824,7 @@ class TestEventProcessor:
         # Verify message processing was called
         ep._process_message_event.assert_called_once()
     
-    async def test_cold_session_skip(self, mock_config):
+    async def test_event_processor_skips_cold_sessions_appropriately(self, mock_config):
         """Test that cold sessions skip history processing."""
         mock_tm = Mock()
         mock_tm.get_target_lock.return_value = asyncio.Lock()
@@ -862,10 +862,10 @@ class TestEventProcessor:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestMochatChannel:
+class TestMochatChannelIntegration:
     """Test MochatChannel integration."""
     
-    async def test_initialization_validation(self, mock_bus):
+    async def test_mochat_channel_validates_configuration_on_initialization(self, mock_bus):
         """Test configuration validation during initialization."""
         # Invalid token
         config = Mock()
@@ -883,7 +883,7 @@ class TestMochatChannel:
         with pytest.raises(ValueError, match="must start with http"):
             channel._validate_config()
     
-    async def test_send_message_validation(self, mock_config, mock_bus):
+    async def test_mochat_channel_validates_outbound_messages_before_sending(self, mock_config, mock_bus):
         """Test outbound message validation."""
         channel = MochatChannel(mock_config, mock_bus)
         
@@ -908,7 +908,7 @@ class TestMochatChannel:
         await channel.send(invalid_msg)  # Should not crash
     
     @patch('nanobot.channels.mochat.ConnectionManager')
-    async def test_component_lifecycle(self, mock_cm_class, mock_config, mock_bus):
+    async def test_mochat_channel_manages_component_lifecycle_properly(self, mock_cm_class, mock_config, mock_bus):
         """Test component initialization lifecycle."""
         mock_cm = AsyncMock()
         mock_cm_class.return_value = mock_cm
@@ -924,7 +924,7 @@ class TestMochatChannel:
         assert channel._message_buffer is not None
         assert channel._event_processor is not None
     
-    async def test_health_status_reporting(self, mock_config, mock_bus):
+    async def test_mochat_channel_reports_aggregated_health_status(self, mock_config, mock_bus):
         """Test health status reporting."""
         channel = MochatChannel(mock_config, mock_bus)
         
@@ -937,7 +937,7 @@ class TestMochatChannel:
         assert not channel.is_ready
         assert channel.connection_state == ConnectionState.DISCONNECTED
     
-    async def test_backward_compatibility(self):
+    async def test_mochat_channel_maintains_backward_compatibility_with_legacy_apis(self):
         """Test backward compatibility exports."""
         from nanobot.channels.mochat import _safe_dict, _str_field, _make_synthetic_event
         
@@ -957,10 +957,10 @@ class TestMochatChannel:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio 
-class TestPerformance:
+class TestMochatChannelPerformance:
     """Performance and stress tests."""
     
-    async def test_large_message_deduplication(self, mock_config):
+    async def test_message_buffer_handles_large_volume_deduplication_efficiently(self, mock_config):
         """Test deduplication with large number of messages."""
         mb = MessageBuffer(mock_config)
         
@@ -972,7 +972,7 @@ class TestPerformance:
         # Check queue size limit
         assert len(mb._seen_queues["session:1"]) <= 2000  # MAX_SEEN_MESSAGE_IDS
     
-    async def test_concurrent_message_processing(self, mock_config):
+    async def test_message_buffer_processes_concurrent_messages_thread_safely(self, mock_config):
         """Test concurrent message processing."""
         mb = MessageBuffer(mock_config)
         

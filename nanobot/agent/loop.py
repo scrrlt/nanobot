@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import signal
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
@@ -110,7 +112,13 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._task_cleanup_lock = asyncio.Lock()  # Prevents race conditions in task cleanup
         self._processing_lock = asyncio.Lock()
+        
+        # Graceful shutdown support
+        self._shutdown_event = asyncio.Event()
+        self._graceful_shutdown = False
+        
         self._register_default_tools()
+        self._setup_signal_handlers()
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -129,6 +137,35 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+
+    def _setup_signal_handlers(self) -> None:
+        """
+        Setup signal handlers for graceful shutdown.
+        
+        Handles SIGTERM and SIGINT to ensure clean shutdown of:
+        - Active message processing tasks
+        - Subagents and their resources  
+        - Memory consolidation
+        - MCP server connections
+        """
+        if sys.platform != "win32":
+            # Unix-like systems support signal handling
+            def signal_handler(signum: int) -> None:
+                signal_name = signal.Signals(signum).name
+                logger.info("Received signal {}, initiating graceful shutdown...", signal_name)
+                self._graceful_shutdown = True
+                self._shutdown_event.set()
+            
+            # Register signal handlers in event loop
+            try:
+                loop = asyncio.get_event_loop()
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
+                logger.debug("Signal handlers registered for SIGTERM and SIGINT")
+            except (RuntimeError, NotImplementedError) as e:
+                logger.warning("Could not register signal handlers: {}", e)
+        else:
+            logger.debug("Signal handling not available on Windows")
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -266,27 +303,143 @@ class AgentLoop:
         return final_content, tools_used, messages
 
     async def run(self) -> None:
-        """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
+        """Run the agent loop with signal handling for graceful shutdown."""
         self._running = True
+        self._shutdown_event.clear()
         await self._connect_mcp()
         logger.info("Agent loop started")
 
-        while self._running:
-            try:
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-
-            if msg.content.strip().lower() == "/stop":
-                await self._handle_stop(msg)
-            else:
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(
-                    lambda t, key=msg.session_key: asyncio.create_task(
-                        self._cleanup_task(t, key)
+        try:
+            # Main processing loop with signal handling
+            while self._running and not self._graceful_shutdown:
+                try:
+                    # Check for shutdown signal
+                    shutdown_task = asyncio.create_task(self._shutdown_event.wait())
+                    consume_task = asyncio.create_task(self.bus.consume_inbound())
+                    
+                    # Wait for either message or shutdown signal
+                    done, pending = await asyncio.wait(
+                        [shutdown_task, consume_task],
+                        timeout=1.0,
+                        return_when=asyncio.FIRST_COMPLETED
                     )
+                    
+                    # Cancel pending tasks
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    
+                    # Handle shutdown signal
+                    if shutdown_task in done:
+                        logger.info("Shutdown signal received, stopping gracefully...")
+                        break
+                        
+                    # Handle message if available
+                    if consume_task in done:
+                        msg = await consume_task
+                        
+                        if msg.content.strip().lower() == "/stop":
+                            await self._handle_stop(msg)
+                        else:
+                            task = asyncio.create_task(self._dispatch(msg))
+                            self._active_tasks.setdefault(msg.session_key, []).append(task)
+                            task.add_done_callback(
+                                lambda t, key=msg.session_key: asyncio.create_task(
+                                    self._cleanup_task(t, key)
+                                )
+                            )
+                        
+                except asyncio.TimeoutError:
+                    # Timeout is expected, continue loop
+                    continue
+                    
+        except Exception as e:
+            logger.exception("Unexpected error in agent loop: {}", e)
+        finally:
+            await self._shutdown_gracefully()
+            
+    async def _shutdown_gracefully(self) -> None:
+        """
+        Perform graceful shutdown of all agent components.
+        
+        This ensures:
+        - All active tasks are cancelled and awaited
+        - Memory is consolidated and saved
+        - Subagents are properly closed
+        - MCP connections are terminated cleanly
+        """
+        logger.info("Beginning graceful shutdown...")
+        self._running = False
+        
+        # Cancel and wait for all active tasks
+        all_tasks = []
+        for session_tasks in self._active_tasks.values():
+            all_tasks.extend(session_tasks)
+            
+        if all_tasks:
+            logger.info("Cancelling {} active tasks...", len(all_tasks))
+            for task in all_tasks:
+                if not task.done():
+                    task.cancel()
+                    
+            # Wait for all tasks to complete with timeout
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*all_tasks, return_exceptions=True),
+                    timeout=10.0
                 )
+                logger.info("All active tasks cancelled successfully")
+            except asyncio.TimeoutError:
+                logger.warning("Some tasks did not shutdown within timeout")
+        
+        # Close subagents and their resources
+        try:
+            await self.subagents.close_all()
+            logger.debug("Subagents closed successfully")
+        except Exception as e:
+            logger.warning("Error closing subagents: {}", e)
+            
+        # Consolidate and save memory
+        try:
+            if hasattr(self, 'memory') and self.memory:
+                await self.memory.consolidate_and_save()
+                logger.debug("Memory consolidated and saved")
+        except Exception as e:
+            logger.warning("Error saving memory: {}", e)
+            
+        # Close MCP connections
+        try:
+            await self.close_mcp()
+            logger.debug("MCP connections closed")
+        except Exception as e:
+            logger.warning("Error closing MCP connections: {}", e)
+            
+        logger.info("Graceful shutdown completed")
+        
+    def stop(self) -> None:
+        """
+        Signal the agent loop to stop gracefully.
+        
+        This is a synchronous method that can be called from signal handlers
+        or other contexts to initiate shutdown.
+        """
+        logger.info("Stop requested")
+        self._graceful_shutdown = True
+        self._shutdown_event.set()
+        
+    def stop(self) -> None:
+        """
+        Signal the agent loop to stop gracefully.
+        
+        This is a synchronous method that can be called from signal handlers
+        or other contexts to initiate shutdown.
+        """
+        logger.info("Stop requested")
+        self._graceful_shutdown = True
+        self._shutdown_event.set()
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
