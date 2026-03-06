@@ -72,8 +72,18 @@ export class BridgeServer {
 
     ws.on('message', async (data) => {
       try {
-        const cmd = JSON.parse(data.toString()) as SendCommand;
-        await this.handleCommand(cmd);
+        const cmd = JSON.parse(data.toString());
+        
+        // Validate command structure
+        if (!cmd || typeof cmd !== 'object' || cmd.type !== 'send' || !cmd.to) {
+          ws.send(JSON.stringify({ 
+            type: 'error', 
+            error: 'Invalid command: expected {type: "send", to: string, text: string}' 
+          }));
+          return;
+        }
+        
+        await this.handleCommand(cmd as SendCommand);
         ws.send(JSON.stringify({ type: 'sent', to: cmd.to }));
       } catch (error) {
         console.error('Error handling command:', error);

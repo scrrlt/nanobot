@@ -315,6 +315,10 @@ class DiscordChannel(BaseChannel):
             headers = {"Authorization": f"Bot {self.config.token}"}
             while self._running:
                 try:
+                    # Defensively check that _http is still available
+                    if not self._running or self._http is None:
+                        logger.debug("Discord typing loop exiting: connection closed")
+                        return
                     await self._http.post(url, headers=headers)
                 except asyncio.CancelledError:
                     return
