@@ -352,7 +352,6 @@ def gateway(
         return response
     cron.on_job = on_cron_job
 
-    # Create channel manager
     channels = ChannelManager(config, bus)
 
     def _pick_heartbeat_target() -> tuple[str, str]:

@@ -97,7 +97,7 @@ export class WhatsAppClient {
           }, 5000);
         }
       } else if (connection === 'open') {
-        console.log('✅ Connected to WhatsApp');
+        console.log('Connected to WhatsApp');
         this.options.onStatus('connected');
       }
     });

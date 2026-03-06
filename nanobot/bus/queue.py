@@ -19,14 +19,12 @@ class BusMetrics:
     inbound_depth_samples: deque = field(default_factory=lambda: deque(maxlen=100))
     outbound_depth_samples: deque = field(default_factory=lambda: deque(maxlen=100))
     
-    # Processing latency tracking (seconds)
     processing_latencies: deque = field(default_factory=lambda: deque(maxlen=100))
     
     # Event drop counters
     inbound_drops: int = 0
     outbound_drops: int = 0
     
-    # Throughput counters
     inbound_processed: int = 0
     outbound_processed: int = 0
     

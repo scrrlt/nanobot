@@ -12,7 +12,6 @@ from loguru import logger
 
 from nanobot.agent.tools.base import Tool
 
-# Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
 MAX_REDIRECTS = 5  # Limit redirects to prevent DoS attacks
 

@@ -46,14 +46,12 @@ try:
 except ImportError:
     MSGPACK_AVAILABLE = False
 
-# Python 3.12+ Type Aliases
 type JsonDict = dict[str, Any]
 type DispatchCallback = Callable[[str, str, str, dict[str, Any]], Awaitable[None]]
 type EventHandler = Callable[..., Awaitable[None]]
 type TargetLockMap = dict[str, asyncio.Lock]
 type MessageEntryList = list[Any]
 
-# Configuration constants
 MAX_SEEN_MESSAGE_IDS = 10000  # Increased for high-volume scenarios
 CURSOR_SAVE_DEBOUNCE_S = 0.5
 DEFAULT_RETRY_ATTEMPTS = 3
@@ -63,22 +61,14 @@ CONNECTION_TIMEOUT_S = 30.0
 DEFAULT_HEALTH_CHECK_INTERVAL_S = 60.0
 FALLBACK_DRAIN_TIMEOUT_S = 5.0  # Maximum time to wait for fallback workers to drain
 
-# Socket.IO API constants
 SOCKET_SUBSCRIBE_SESSIONS = "com.claw.im.subscribeSessions"
 SOCKET_SUBSCRIBE_PANELS = "com.claw.im.subscribePanels"
 SOCKET_NOTIFY_MESSAGE_ADD = "notify:chat.message.add"
 
-# Event type constants
 EVENT_TYPE_MESSAGE_ADD = "message.add"
 
-# Time constants
 DAY_SECONDS = 86400  # 24 hours in seconds
 MAX_LOCKS_DEFAULT = 1000
-
-
-# ---------------------------------------------------------------------------
-# Type definitions and protocols
-# ---------------------------------------------------------------------------
 
 
 class ConnectionState(Enum):
@@ -144,11 +134,6 @@ class AuthorInfo(Protocol):
     agentId: str | None
 
 
-# ---------------------------------------------------------------------------
-# Exception classes
-# ---------------------------------------------------------------------------
-
-
 class MochatError(Exception):
     """Base exception for Mochat-related errors."""
 
@@ -206,11 +191,6 @@ class RetryExhaustedError(MochatError):
     """Raised when retry attempts are exhausted."""
 
     pass
-
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -345,11 +325,6 @@ class HealthStatus:
     checked_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
-# ---------------------------------------------------------------------------
-# Utility classes and functions
-# ---------------------------------------------------------------------------
-
-
 class CircuitBreaker:
     """Circuit breaker for handling repeated failures."""
 
@@ -390,10 +365,6 @@ class CircuitBreaker:
 
 
 # ---------------------------------------------------------------------------
-# Pure helper functions with type safety
-# ---------------------------------------------------------------------------
-
-
 def safe_dict(value: Any) -> dict[str, Any]:
     """Return value if it's a dict, else empty dict.
 
@@ -673,11 +644,6 @@ def parse_timestamp(value: Any) -> int | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Connection Management Classes
-# ---------------------------------------------------------------------------
-
-
 class ConnectionManager:
     """Manages websocket and HTTP connections with health monitoring."""
 
@@ -698,7 +664,6 @@ class ConnectionManager:
         self._health_check_task: Optional[asyncio.Task[None]] = None
         self._state_lock = asyncio.Lock()
 
-        # Event handlers
         self._on_connect: Optional[Callable[[], Awaitable[None]]] = None
         self._on_disconnect: Optional[Callable[[], Awaitable[None]]] = None
         self._on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
@@ -2181,19 +2146,11 @@ class MochatChannel(BaseChannel):
 
     async def _initialize_components(self) -> None:
         """Initialize all component instances."""
-        # State manager
         self._state_manager = StateManager(self._state_dir)
         await self._state_manager.load()
 
-        # Connection manager
-        retry_config = RetryConfig(
-            max_attempts=self.config.max_retry_attempts or DEFAULT_RETRY_ATTEMPTS,
-            base_delay_ms=self.config.retry_delay_ms or DEFAULT_RETRY_DELAY_MS,
-        )
-
         self._connection_manager = ConnectionManager(self.config, retry_config)
 
-        # Target manager
         self._target_manager = TargetManager(
             self.config, self._connection_manager, self._state_manager
         )
@@ -2201,7 +2158,6 @@ class MochatChannel(BaseChannel):
         # Message buffer
         self._message_buffer = MessageBuffer(self.config)
 
-        # Event processor
         self._event_processor = EventProcessor(
             config=self.config,
             target_manager=self._target_manager,
