@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import tempfile
 import time
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import deque, OrderedDict
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -40,7 +42,6 @@ except ImportError:
     SOCKETIO_AVAILABLE = False
 
 try:
-    import msgpack  # noqa: F401
     MSGPACK_AVAILABLE = True
 except ImportError:
     MSGPACK_AVAILABLE = False
@@ -1010,6 +1011,75 @@ class ConnectionManager:
             correlation_id
         )
     
+    async def http_upload(
+        self,
+        endpoint: str,
+        files: Dict[str, Any],
+        correlation_id: Optional[CorrelationId] = None
+    ) -> Any:
+        """Upload files via HTTP with retry logic."""
+        correlation_id = correlation_id or CorrelationId()
+        
+        if not self.http_client:
+            raise MochatConnectionError("HTTP client not available")
+        
+        # Circuit breaker check
+        if not self.circuit_breaker.can_execute():
+            raise MochatConnectionError(f"Circuit breaker open, upload blocked [{correlation_id}]")
+        
+        url = f"{self.base_url.rstrip('/')}{endpoint}"
+        last_error: Optional[Exception] = None
+        
+        for attempt in range(self.retry_config.max_attempts):
+            try:
+                logger.debug(
+                    "HTTP upload attempt {} to {} [{}]",
+                    attempt + 1, endpoint, correlation_id
+                )
+                
+                async with self.http_timeout() as timeout:
+                    response = await self.http_client.post(
+                        url,
+                        files=files,
+                        headers={"Authorization": f"Bearer {self.auth_token}"},
+                        timeout=timeout
+                    )
+                    
+                if response.is_success:
+                    self.circuit_breaker.record_success()
+                    result = response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
+                    logger.debug("Upload successful [{}]", correlation_id)
+                    return self._process_api_response(result, correlation_id)
+                else:
+                    raise APIError(
+                        f"Upload failed with status {response.status_code}",
+                        response.status_code,
+                        correlation_id
+                    )
+                    
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                last_error = e
+                if attempt == self.retry_config.max_attempts - 1:
+                    self.circuit_breaker.record_failure()
+                    raise MochatConnectionError(
+                        f"HTTP upload failed: {e}",
+                        correlation_id
+                    ) from e
+                
+                delay = self.retry_config.calculate_delay(attempt)
+                logger.debug(
+                    "Upload attempt {} failed, retrying in {}ms [{}]: {}",
+                    attempt + 1, delay, correlation_id, e
+                )
+                await asyncio.sleep(delay / 1000)
+                
+        # Should never reach here due to the raise in the loop
+        self.circuit_breaker.record_failure()
+        raise RetryExhaustedError(
+            f"HTTP upload failed after {self.retry_config.max_attempts} attempts",
+            correlation_id
+        )
+    
     def _process_api_response(
         self, 
         response: Any, 
@@ -1304,7 +1374,7 @@ class StateManager:
         await self.save()
     
     async def save(self, force: bool = False) -> None:
-        """Save state to disk."""
+        """Save state to disk using atomic writes."""
         async with self._save_lock:
             try:
                 # Cancel pending save task if forcing
@@ -1325,7 +1395,21 @@ class StateManager:
                 }
                 
                 content = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-                self.cursor_path.write_text(content, "utf-8")
+                
+                # Atomic write: write to temp file, then replace
+                temp_path = self.cursor_path.with_suffix('.tmp')
+                try:
+                    temp_path.write_text(content, "utf-8")
+                    if os.name == 'nt':
+                        # Windows requires target removal before replace
+                        if self.cursor_path.exists():
+                            self.cursor_path.unlink()
+                    temp_path.replace(self.cursor_path)
+                except Exception:
+                    # Clean up temp file on error
+                    if temp_path.exists():
+                        temp_path.unlink()
+                    raise
                 
                 logger.debug("Saved {} session cursors", len(self.session_cursors))
                 
@@ -1397,11 +1481,25 @@ class TargetManager:
         )
     
     def get_target_lock(self, target_kind: str, target_id: str) -> asyncio.Lock:
-        """Get or create a lock for target operations."""
+        """Get or create a lock for target operations with LRU eviction."""
         key = f"{target_kind}:{target_id}"
-        if key not in self._target_locks:
-            self._target_locks[key] = asyncio.Lock()
-        return self._target_locks[key]
+        
+        # Move to end if exists (mark as recently used)
+        if key in self._target_locks:
+            lock = self._target_locks.pop(key)
+            self._target_locks[key] = lock
+            return lock
+        
+        # Create new lock
+        lock = asyncio.Lock()
+        self._target_locks[key] = lock
+        
+        # Evict oldest if over limit
+        while len(self._target_locks) > self._max_locks:
+            oldest_key, _ = self._target_locks.popitem(last=False)
+            logger.debug("Evicted stale target lock: {}", oldest_key)
+            
+        return lock
     
     def is_cold_session(self, session_id: str) -> bool:
         """Check if session is in cold start state."""
@@ -1509,7 +1607,13 @@ class TargetManager:
         success &= await self._subscribe_sessions(sorted(self.session_set))
         success &= await self._subscribe_panels(sorted(self.panel_set))
         
-        return success
+    def update_panel_cursor(self, panel_id: str, timestamp: str) -> None:
+        """Update panel cursor for efficient polling."""
+        self.panel_cursors[panel_id] = timestamp
+        
+    def get_panel_cursor(self, panel_id: str) -> Optional[str]:
+        """Get panel cursor for since-based polling."""
+        return self.panel_cursors.get(panel_id)
     
     async def _subscribe_sessions(self, session_ids: List[str]) -> bool:
         """Subscribe to session events."""
@@ -1587,6 +1691,19 @@ class TargetManager:
             
         except Exception as e:
             return {"result": False, "message": str(e)}
+    
+    def update_panel_cursor(self, panel_id: str, timestamp: str) -> None:
+        """Update panel cursor for efficient polling."""
+        self.panel_cursors[panel_id] = timestamp
+        
+    def get_panel_cursor(self, panel_id: str) -> Optional[str]:
+        """Get panel cursor for since-based polling."""
+        return self.panel_cursors.get(panel_id)
+    
+    # Public methods to fix encapsulation violations
+    async def refresh_sessions(self, subscribe_new: bool) -> None:
+        """Public method to refresh sessions."""
+        await self._refresh_sessions(subscribe_new)
 
 
 class EventProcessor:
@@ -1605,6 +1722,16 @@ class EventProcessor:
         self.message_buffer = message_buffer
         self.state_manager = state_manager
         self.dispatch_callback = dispatch_callback
+    
+    # Public methods to fix encapsulation violations
+    async def process_message_event(
+        self, 
+        target_id: str, 
+        event: Dict[str, Any], 
+        target_kind: TargetKind
+    ) -> None:
+        """Public method to process message events."""
+        await self._process_message_event(target_id, event, target_kind)
     
     async def handle_watch_payload(
         self, 
@@ -2084,28 +2211,44 @@ class MochatChannel(BaseChannel):
                 await asyncio.sleep(max(0.1, self.config.retry_delay_ms / 1000.0))
     
     async def _panel_fallback_worker(self, panel_id: str) -> None:
-        """HTTP polling worker for a specific panel."""
+        """HTTP polling worker for a specific panel with cursor tracking."""
         sleep_interval = max(1.0, self.config.refresh_interval_ms / 1000.0)
         
         while self._running and self._fallback_mode:
             try:
-                if not self._connection_manager:
+                if not self._connection_manager or not self._target_manager:
                     break
+                
+                # Build request payload with cursor support
+                payload = {
+                    "panelId": panel_id,
+                    "limit": min(100, max(1, self.config.watch_limit)),
+                }
+                
+                # Add since parameter if we have a cursor
+                since_cursor = self._target_manager.get_panel_cursor(panel_id)
+                if since_cursor:
+                    payload["since"] = since_cursor
                     
                 response = await self._connection_manager.http_request(
                     "POST",
                     "/api/claw/groups/panels/messages",
-                    {
-                        "panelId": panel_id,
-                        "limit": min(100, max(1, self.config.watch_limit)),
-                    }
+                    payload
                 )
                 
                 messages = response.get("messages")
-                if isinstance(messages, list):
+                if isinstance(messages, list) and messages:
+                    # Process messages in chronological order
+                    latest_timestamp = None
+                    
                     for message_data in reversed(messages):
                         if not isinstance(message_data, dict):
                             continue
+                            
+                        # Track latest timestamp for cursor
+                        msg_timestamp = message_data.get("createdAt")
+                        if msg_timestamp:
+                            latest_timestamp = msg_timestamp
                             
                         # Create synthetic event
                         event = make_synthetic_event(
@@ -2115,14 +2258,18 @@ class MochatChannel(BaseChannel):
                             meta=message_data.get("meta"),
                             group_id=str(response.get("groupId") or ""),
                             converse_id=panel_id,
-                            timestamp=message_data.get("createdAt"),
+                            timestamp=msg_timestamp,
                             author_info=message_data.get("authorInfo"),
                         )
                         
                         if self._event_processor:
-                            await self._event_processor._process_message_event(
+                            await self._event_processor.process_message_event(
                                 panel_id, event, TargetKind.PANEL
                             )
+                    
+                    # Update cursor to latest timestamp
+                    if latest_timestamp:
+                        self._target_manager.update_panel_cursor(panel_id, latest_timestamp)
                 
                 # Sleep to throttle polling
                 await asyncio.sleep(sleep_interval)
@@ -2194,7 +2341,7 @@ class MochatChannel(BaseChannel):
                         self._connection_manager.socket_client and
                         self._connection_manager.connection_state == ConnectionState.CONNECTED
                     )
-                    await self._target_manager._refresh_sessions(ws_ready)
+                    await self._target_manager.refresh_sessions(ws_ready)
                     session_id = self._target_manager.session_by_converse.get(converse_id)
                     
             if not session_id:
@@ -2219,7 +2366,7 @@ class MochatChannel(BaseChannel):
             )
             
             if self._event_processor:
-                await self._event_processor._process_message_event(
+                await self._event_processor.process_message_event(
                     session_id, event, TargetKind.SESSION
                 )
                 
@@ -2258,7 +2405,7 @@ class MochatChannel(BaseChannel):
             )
             
             if self._event_processor:
-                await self._event_processor._process_message_event(
+                await self._event_processor.process_message_event(
                     panel_id, event, TargetKind.PANEL
                 )
                 
@@ -2266,24 +2413,42 @@ class MochatChannel(BaseChannel):
             logger.exception("Error handling chat message notification: {}", e)
     
     async def send(self, msg: OutboundMessage) -> None:
-        """Send outbound message to session or panel."""
+        """Send outbound message to session or panel with media support."""
         if not self._initialization_complete:
             logger.warning("Cannot send message - channel not initialized")
             return
             
         try:
-            # Build content
+            # Build content and handle media
             parts = []
             if msg.content and msg.content.strip():
                 parts.append(msg.content.strip())
+            
+            # Handle media uploads
+            uploaded_media = []
             if msg.media:
-                parts.extend(
-                    media for media in msg.media 
-                    if isinstance(media, str) and media.strip()
-                )
+                for media_item in msg.media:
+                    if isinstance(media_item, str) and media_item.strip():
+                        # Check if it's a file path that exists
+                        media_path = Path(media_item.strip())
+                        if media_path.exists() and media_path.is_file():
+                            try:
+                                # Upload media file
+                                media_id = await self._upload_media(media_path)
+                                if media_id:
+                                    uploaded_media.append(media_id)
+                                else:
+                                    # Fallback: append as text
+                                    parts.append(f"[Media: {media_path.name}]")
+                            except Exception as e:
+                                logger.warning("Media upload failed for {}: {}", media_path, e)
+                                parts.append(f"[Media: {media_path.name}]")
+                        else:
+                            # Not a file path, append as text
+                            parts.append(media_item.strip())
             
             content = "\n".join(parts).strip()
-            if not content:
+            if not content and not uploaded_media:
                 logger.debug("Skipping empty message")
                 return
             
@@ -2308,17 +2473,20 @@ class MochatChannel(BaseChannel):
                     await self._send_panel_message(
                         target.id, content, msg.reply_to, 
                         self._extract_group_id(msg.metadata),
-                        correlation_id
+                        correlation_id,
+                        uploaded_media
                     )
                 else:
                     await self._send_session_message(
-                        target.id, content, msg.reply_to, correlation_id
+                        target.id, content, msg.reply_to, correlation_id,
+                        uploaded_media
                     )
                     
                 logger.debug(
-                    "Sent message to {} {} [{}]",
+                    "Sent message to {} {} with {} media [{}]",
                     "panel" if is_panel else "session",
                     target.id,
+                    len(uploaded_media),
                     correlation_id
                 )
                 
@@ -2331,16 +2499,62 @@ class MochatChannel(BaseChannel):
         except Exception as e:
             logger.exception("Error in send method: {}", e)
     
+    async def _upload_media(self, media_path: Path) -> Optional[str]:
+        """Upload media file to Mochat and return media ID."""
+        if not self._connection_manager:
+            return None
+            
+        try:
+            # Read file data
+            file_data = media_path.read_bytes()
+            file_name = media_path.name
+            
+            # Prepare multipart form data
+            files = {
+                'file': (file_name, file_data, self._get_mime_type(media_path))
+            }
+            
+            # Upload via HTTP client
+            response = await self._connection_manager.http_upload(
+                "/api/claw/media/upload",
+                files=files
+            )
+            
+            if isinstance(response, dict) and response.get("mediaId"):
+                logger.debug("Uploaded media: {} -> {}", file_name, response["mediaId"])
+                return response["mediaId"]
+            
+        except Exception as e:
+            logger.warning("Failed to upload media {}: {}", media_path.name, e)
+            
+        return None
+    
+    def _get_mime_type(self, file_path: Path) -> str:
+        """Get MIME type based on file extension."""
+        suffix = file_path.suffix.lower()
+        mime_types = {
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.pdf': 'application/pdf',
+            '.txt': 'text/plain',
+            '.doc': 'application/msword',
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        }
+        return mime_types.get(suffix, 'application/octet-stream')
+    
     async def _send_session_message(
         self,
         session_id: str,
         content: str,
         reply_to: Optional[str],
-        correlation_id: CorrelationId
+        correlation_id: CorrelationId,
+        media_ids: Optional[List[str]] = None
     ) -> None:
-        """Send message to a session."""
+        """Send message to a session with optional media."""
         if not self._connection_manager:
-            raise ConnectionError("Connection manager not available")
+            raise MochatConnectionError("Connection manager not available")
             
         payload = {
             "sessionId": session_id,
@@ -2349,6 +2563,9 @@ class MochatChannel(BaseChannel):
         
         if reply_to:
             payload["replyTo"] = reply_to
+            
+        if media_ids:
+            payload["mediaIds"] = media_ids
             
         await self._connection_manager.http_request(
             "POST",
@@ -2363,11 +2580,12 @@ class MochatChannel(BaseChannel):
         content: str,
         reply_to: Optional[str],
         group_id: Optional[str],
-        correlation_id: CorrelationId
+        correlation_id: CorrelationId,
+        media_ids: Optional[List[str]] = None
     ) -> None:
-        """Send message to a panel."""
+        """Send message to a panel with optional media."""
         if not self._connection_manager:
-            raise ConnectionError("Connection manager not available")
+            raise MochatConnectionError("Connection manager not available")
             
         payload = {
             "panelId": panel_id,
@@ -2379,6 +2597,9 @@ class MochatChannel(BaseChannel):
             
         if group_id:
             payload["groupId"] = group_id
+            
+        if media_ids:
+            payload["mediaIds"] = media_ids
             
         await self._connection_manager.http_request(
             "POST",
